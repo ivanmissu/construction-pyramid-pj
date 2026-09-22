@@ -45,6 +45,7 @@ export type BlockSystem = {
   starts: Float32Array[]; // 每块石块的砌筑时刻（时间轴 0-1）
   sloped: boolean;
   fills: THREE.Mesh[]; // 每道砌层的实体填充（避免塔体空心）
+  fillMaterial: THREE.MeshStandardMaterial;
   seams: THREE.Mesh[]; // 贴在平整外壳上的细密石缝带
   fillStarts: Float32Array; // 每道填充层的升起时刻
   fillDur: number;
@@ -88,6 +89,11 @@ export function buildBlockCourses(
   const quats: Float32Array[] = [];
   const starts: Float32Array[] = [];
   const fills: THREE.Mesh[] = [];
+  // Cross-section caps stack along the view ray. Give the solid infill its own
+  // opacity so ghost views reveal chambers without removing the visible face stones.
+  const fillMaterial = mat.clone();
+  fillMaterial.transparent = true;
+  fillMaterial.depthWrite = true;
   const seams: THREE.Mesh[] = [];
   const fillStarts = new Float32Array(nCourses);
 
@@ -187,7 +193,7 @@ export function buildBlockCourses(
     // 实体填充（棱台）：保证塔体实心，外圈石块负责“砌筑”外观
     // 先让所有填充 + 贴面在初始状态下完全隐藏，由 applyProgress 控制显现。
     const fillGeo = frustumGeometry(b, t, layerH * 1.002);
-    const fill = new THREE.Mesh(fillGeo, mat);
+    const fill = new THREE.Mesh(fillGeo, fillMaterial);
     fill.position.y = y0;
     fill.castShadow = true;
     fill.receiveShadow = true;
@@ -285,6 +291,7 @@ export function buildBlockCourses(
     quats,
     starts,
     fills,
+    fillMaterial,
     seams,
     fillStarts,
     fillDur: Math.max(dur, step * (perCourse - 1) + dur),
@@ -1012,7 +1019,7 @@ export function buildModel(): BuiltScene {
   plateau.receiveShadow = true;
   extra.add(plateau);
 
-  // 采石场方料：贴着塔基摆放（不再散落到远处地平线，避免出现“莫名其妙的小方块”）
+  // 两处后方供料场：成排码放，给塔基四周的工队和雪橇留出运输通道。
   const blockGeo = new THREE.BoxGeometry(0.22, 0.16, 0.28);
   const blockCount = 160;
   const blocks = new THREE.InstancedMesh(blockGeo, blockMat, blockCount);
@@ -1027,24 +1034,19 @@ export function buildModel(): BuiltScene {
     return rnd / 2147483648;
   };
   for (let i = 0; i < blockCount; i++) {
-    const ang = rand() * Math.PI * 2;
-    // 只在塔基四周的施工场（半径 14–21 场景单位 ≈ 140–210 m）堆放石料
-    const rad = (HALF + 2.5) / Math.max(Math.abs(Math.cos(ang)), Math.abs(Math.sin(ang))) + rand() * 4;
-    if (i % 3 === 0) {
-      // 施工场上的方料堆（成排码放）
-      m4.compose(
-        new THREE.Vector3(Math.cos(ang) * rad, 0.08, Math.sin(ang) * rad),
-        q.setFromEuler(new THREE.Euler(0, rand() * 0.6, 0)),
-        scl.set(1.1, 1.1, 1.1),
-      );
-    } else {
-      m4.compose(
-        new THREE.Vector3(Math.cos(ang) * rad, 0.08, Math.sin(ang) * rad),
-        q.setFromEuler(new THREE.Euler(0, rand() * Math.PI, 0)),
-        scl.set(0.7 + rand() * 1.2, 0.7 + rand() * 0.6, 0.7 + rand() * 0.8),
-      );
-    }
-    m4.elements[13] = 0.08 * scl.y;
+    const yard = Math.floor(i / 80);
+    const slot = i % 80;
+    const row = Math.floor(slot / 8);
+    const column = slot % 8;
+    const x = (yard === 0 ? -10.6 : 7) + column * 0.52;
+    const z = -22.4 - row * 0.5 - Math.floor(row / 5) * 0.25;
+    // 小幅尺寸和朝向变化保留石料质感；间距覆盖最大尺寸，避免互相穿插。
+    scl.set(0.7 + rand() * 1.2, 0.7 + rand() * 0.6, 0.7 + rand() * 0.8);
+    m4.compose(
+      new THREE.Vector3(x, 0.08 * scl.y, z),
+      q.setFromEuler(new THREE.Euler(0, (rand() - 0.5) * 0.12, 0)),
+      scl,
+    );
     blocks.setMatrixAt(i, m4);
   }
   blocks.castShadow = true;
@@ -1523,6 +1525,8 @@ export class KhufuViewer {
       const wf = partial.wireframe;
       this.built.casingMat.wireframe = wf;
       this.built.coreMat.wireframe = wf;
+      this.built.coreSys.fillMaterial.wireframe = wf;
+      this.built.casingSys.fillMaterial.wireframe = wf;
       this.todayExterior?.materials.forEach((material) => { material.wireframe = wf; });
     }
     if (partial.showLabels !== undefined && this.labelHost) {
@@ -1636,6 +1640,10 @@ export class KhufuViewer {
     const inside = mode === 'inside';
     this.built.coreMat.clippingPlanes = cut ? [clip, clip2] : [];
     this.built.casingMat.clippingPlanes = cut ? [clip, clip2] : [];
+    this.built.coreSys.fillMaterial.clippingPlanes = cut ? [clip, clip2] : [];
+    this.built.casingSys.fillMaterial.clippingPlanes = cut ? [clip, clip2] : [];
+    this.built.coreSys.fillMaterial.needsUpdate = true;
+    this.built.casingSys.fillMaterial.needsUpdate = true;
     this.built.coreMat.needsUpdate = true;
     this.built.casingMat.needsUpdate = true;
 
@@ -1663,7 +1671,9 @@ export class KhufuViewer {
     this.built.coreEdges.visible = false;
 
     // 地面组显隐；补块 / 基坑 / 平台的具体淡入淡出由 updateFinishFade 驱动
-    this.built.extra.visible = mode !== 'interior' && mode !== 'today';
+    this.built.extra.visible = mode !== 'interior';
+    const quarry = this.built.extra.getObjectByName('施工场待用石料');
+    if (quarry) quarry.visible = mode !== 'today';
     // 内部漫游时收掉施工坡道，避免在内部视角里横穿画面
     this.built.rampSlabs.forEach((r) => (r.userData.hidden = inside));
 
@@ -1713,8 +1723,8 @@ export class KhufuViewer {
     let seamT: number;
     let innerT: number; // 内部结构整体不透明度（1 = 完全显示）
     if (translucent) {
-      casingT = 0.28;
-      coreT = p >= 0.66 ? 0.16 : 0.24;
+      casingT = 0.12;
+      coreT = 0.055;
       emisT = 0.45;
       seamT = 0.18;
       innerT = 1;
@@ -1765,7 +1775,7 @@ export class KhufuViewer {
 
     // 始终沿用透明合成队列和深度写入。透明度达到 1 的最后一帧不再
     // 突然重排为不透明物体；砌块与实体填充保持同层，避免交叠面突然跳变。
-    const shellSide = translucent ? THREE.DoubleSide : THREE.FrontSide;
+    const shellSide = THREE.FrontSide;
 
     if (!inside) {
       this.built.casingMat.opacity = this.casingOpCur;
@@ -1782,6 +1792,10 @@ export class KhufuViewer {
     this.built.coreMat.side = shellSide;
     this.built.coreSys.insts.forEach((m) => (m.renderOrder = 1));
     this.built.coreSys.fills.forEach((m) => (m.renderOrder = 1));
+    // Fade the capped internal mass later than its surface. At ghost opacity,
+    // even dozens of course caps remain optically clear; the final value is 1.
+    this.built.coreSys.fillMaterial.opacity = Math.pow(this.coreOpCur, 6);
+    this.built.casingSys.fillMaterial.opacity = Math.pow(this.built.casingMat.opacity, 6);
 
     this.built.casingSys.seams.forEach((m) => {
       m.renderOrder = 4;
@@ -2118,7 +2132,7 @@ export class KhufuViewer {
       // GTAO only acquires the exterior silhouette at 0.99 opacity. Fade its
       // contribution after that point instead of exposing a new shadow at once.
       ambientOcclusion: mode === 'cut' || mode === 'translucent' ? 0
-        : mode === 'today' ? 1 : smooth((Math.min(this.casingOpCur, this.coreOpCur) - 0.99) / 0.01),
+        : mode === 'today' ? 1 : smooth((Math.min(this.built.casingSys.fillMaterial.opacity, this.built.coreSys.fillMaterial.opacity) - 0.99) / 0.01),
     });
   }
 

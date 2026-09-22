@@ -54,12 +54,44 @@ test('AO waits for the shell depth pass and then blends in with continuous opaci
   const viewer = fadingViewer();
   const amounts = [];
   viewer.pipeline = { render: value => amounts.push(value.ambientOcclusion) };
-  for (const opacity of [0.98, 0.989, 0.99, 0.992, 0.995, 0.998, 1]) {
+  for (const opacity of [0.98, 0.99, 0.997, 0.9983, 0.9992, 0.9996, 1]) {
     viewer.casingOpCur = viewer.coreOpCur = opacity;
+    viewer.updateFinishFade(0);
     viewer.renderFrame();
   }
   assert.equal(amounts[0], 0);
-  assert.equal(amounts[2], 0);
+  assert.equal(amounts[3], 0, 'AO must wait for the actual fill material to enter its depth pass');
   assert.ok(amounts[4] > 0 && amounts[4] < 1);
   assert.equal(amounts.at(-1), 1);
+});
+
+test('stacked solid course fills do not turn a translucent view into an opaque wall', () => {
+  const viewer = fadingViewer();
+  viewer.flags.mode = 'translucent';
+  for (let frame = 0; frame < 240; frame++) viewer.updateFinishFade(1 / 60);
+  for (const system of [viewer.built.coreSys, viewer.built.casingSys]) {
+    const combinedTransmission = system.fills.reduce((value, mesh) => value * (1 - mesh.material.opacity), 1);
+    assert.ok(combinedTransmission > 0.9, `stacked fills obscure the internal structure: transmission ${combinedTransmission}`);
+  }
+  viewer.flags.mode = 'solid';
+  for (let frame = 0; frame < 240; frame++) viewer.updateFinishFade(1 / 60);
+  assert.equal(viewer.built.casingSys.fills[0].material.opacity, 1, 'completed masonry must become fully solid');
+});
+
+test('today mode replaces the old apex and keeps the desert under the monument', () => {
+  const viewer = fadingViewer();
+  viewer.flags.mode = 'today';
+  viewer.workers = { update() {} };
+  viewer.appliedP = -1;
+  viewer.applyMode();
+  viewer.updateFinishFade(3);
+  assert.equal(viewer.todayExterior.group.visible, true);
+  assert.equal(viewer.built.core.visible, false);
+  assert.equal(viewer.built.shell.visible, false);
+  assert.equal(viewer.built.extra.visible, true, 'sand and the restored ground share the extra parent');
+  assert.equal(viewer.built.extra.getObjectByName('施工场待用石料').visible, false);
+  viewer.flags.mode = 'solid';
+  viewer.applyMode();
+  assert.equal(viewer.todayExterior.group.visible, false);
+  assert.equal(viewer.built.extra.getObjectByName('施工场待用石料').visible, true);
 });

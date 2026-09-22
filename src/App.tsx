@@ -291,13 +291,21 @@ export default function App() {
                 {c.label}
               </Btn>
             ))}
-            <Btn className="col-span-2" onClick={() => {
+            <Btn title="查看四周运输队、石工区与补给场地" onClick={() => {
+              const progress = flags.progress < 0.02 || flags.progress > 0.84 ? 0.3 : flags.progress;
+              seek(progress, { mode: 'solid', playing: true, autoCamera: false, autoRotate: false });
+              viewer.current?.cameraPreset(35, 35, 55, HEIGHTY(0.12));
+              setDrawer(false);
+            }}>
+              施工全景
+            </Btn>
+            <Btn title="近看搬运与凿石" onClick={() => {
               const progress = flags.progress < 0.02 || flags.progress > 0.84 ? 0.3 : flags.progress;
               seek(progress, { mode: 'solid', playing: true, autoCamera: false, autoRotate: false });
               viewer.current?.focusConstructionSite();
               setDrawer(false);
             }}>
-              施工现场 · 近看搬运与凿石
+              施工近景
             </Btn>
           </div>
           <div className="mt-3 flex flex-wrap gap-1.5">
