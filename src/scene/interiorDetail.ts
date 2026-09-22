@@ -10,6 +10,7 @@
  */
 import * as THREE from 'three';
 import { S } from '../scene/khufu';
+import { createOpenPassageGeometry } from './openPassageGeometry';
 
 const up = new THREE.Vector3(0, 1, 0);
 
@@ -34,8 +35,8 @@ export function createAlignedBox(
   const dir = vb.clone().sub(va);
   const len = dir.length();
   dir.normalize();
-  const right = new THREE.Vector3().crossVectors(dir, up).normalize();
-  const upv = new THREE.Vector3().crossVectors(right, dir).normalize();
+  const right = new THREE.Vector3().crossVectors(up, dir).normalize();
+  const upv = new THREE.Vector3().crossVectors(dir, right).normalize();
 
   const geo = new THREE.BoxGeometry(w * S, h * S, len);
   if (pivotStart) {
@@ -73,8 +74,8 @@ export function buildPassageSteps(
   const va = V(...a);
   const vb = V(...b);
   const dir = vb.clone().sub(va).normalize();
-  const right = new THREE.Vector3().crossVectors(dir, up).normalize();
-  const upv = new THREE.Vector3().crossVectors(right, dir).normalize();
+  const right = new THREE.Vector3().crossVectors(up, dir).normalize();
+  const upv = new THREE.Vector3().crossVectors(dir, right).normalize();
 
   const instGeo = new THREE.BoxGeometry(stepWidth * S, stepHeight * S, stepThickness * S);
   const inst = new THREE.InstancedMesh(instGeo, woodMat, stepCount);
@@ -119,13 +120,13 @@ export function buildGrandGalleryDetail(
     const vb = V(...G1);
     const dir = vb.clone().sub(va).normalize();
     const len = vb.distanceTo(va);
-    const right = new THREE.Vector3().crossVectors(dir, up).normalize();
-    const upv = new THREE.Vector3().crossVectors(right, dir).normalize();
+    const right = new THREE.Vector3().crossVectors(up, dir).normalize();
+    const upv = new THREE.Vector3().crossVectors(dir, right).normalize();
     const ringCount = 18;
     const ringLen = len / ringCount;
     for (let i = 0; i < ringCount; i++) {
       const c = va.clone().addScaledVector(dir, (i + 0.5) * ringLen);
-      const geo = new THREE.BoxGeometry(2.06 * S, 8.6 * S, ringLen * S);
+      const geo = createOpenPassageGeometry(2.06 * S, 8.6 * S, ringLen);
       const mesh = new THREE.Mesh(geo, stoneMat);
       mesh.position.copy(c).addScaledVector(upv, (8.6 * S) / 2);
       mesh.quaternion.setFromRotationMatrix(new THREE.Matrix4().makeBasis(right, upv, dir));
@@ -172,8 +173,8 @@ export function buildGrandGalleryDetail(
   const va = V(...G0);
   const vb = V(...G1);
   const dir = vb.clone().sub(va).normalize();
-  const right = new THREE.Vector3().crossVectors(dir, up).normalize();
-  const upv = new THREE.Vector3().crossVectors(right, dir).normalize();
+  const right = new THREE.Vector3().crossVectors(up, dir).normalize();
+  const upv = new THREE.Vector3().crossVectors(dir, right).normalize();
   const roofGeo = new THREE.BoxGeometry(1.25 * S, 0.45 * S, 0.85 * S);
   const roofInst = new THREE.InstancedMesh(roofGeo, stoneMat, 38);
   const rot = new THREE.Matrix4().makeBasis(right, upv, dir);

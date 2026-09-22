@@ -1,1 +1,54 @@
 @import "tailwindcss";
+
+html {
+  -webkit-font-smoothing: antialiased;
+}
+
+:where(button, input, select, textarea, a[href]):focus-visible {
+  outline: 2px solid #fcd34d;
+  outline-offset: 3px;
+}
+
+.timeline-slider {
+  appearance: none;
+  margin: 0;
+  background: transparent;
+  border-radius: 999px;
+}
+
+.timeline-slider::-webkit-slider-runnable-track {
+  height: 36px;
+  background: transparent;
+}
+
+.timeline-slider::-webkit-slider-thumb {
+  appearance: none;
+  width: 2px;
+  height: 36px;
+  background: transparent;
+}
+
+.timeline-slider::-moz-range-track {
+  height: 36px;
+  background: transparent;
+}
+
+.timeline-slider::-moz-range-thumb {
+  width: 2px;
+  height: 36px;
+  border: 0;
+  background: transparent;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    scroll-behavior: auto !important;
+    transition-duration: 0s !important;
+  }
+
+  .animate-ping {
+    animation: none !important;
+  }
+}

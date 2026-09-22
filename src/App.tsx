@@ -15,8 +15,9 @@ type Flags = {
   wireframe: boolean;
   showLabels: boolean;
   showEdges: boolean;
-  /** 光线追踪式渲染（GTAO 环境光遮蔽 + 泛光） */
+  /** 实时环境反射、接触阴影与柔和高光。 */
   rayTracing: boolean;
+  renderQuality: 'performance' | 'balanced' | 'quality';
 };
 
 const CAM_PRESETS = [
@@ -32,19 +33,22 @@ function HEIGHTY(k: number) {
 export default function App() {
   const viewer = useRef<ViewerHandle | null>(null);
   const fileRef = useRef<HTMLInputElement | null>(null);
-  const [flags, setFlags] = useState<Flags>({
-    // 打开页面默认播放建造动画（progress 从 0 起），看一步一块石头从基岩砌到顶
+  const exitTimer = useRef<number | undefined>(undefined);
+  const [reducedMotion] = useState(() => window.matchMedia('(prefers-reduced-motion: reduce)').matches);
+  const [flags, setFlags] = useState<Flags>(() => ({
+    // 默认从基岩开始建造；尊重系统的“减少动态效果”偏好。
     mode: 'solid',
     progress: 0,
-    playing: true,
+    playing: !reducedMotion,
     speed: 1,
-    autoCamera: true,
+    autoCamera: !reducedMotion,
     autoRotate: false,
     wireframe: false,
     showLabels: true,
     showEdges: true,
-    rayTracing: true, // 默认开启光线追踪（环境光遮蔽 + 泛光）
-  });
+    rayTracing: true,
+    renderQuality: 'balanced',
+  }));
   const [station, setStation] = useState(0);
   const [activeFeature, setActiveFeature] = useState<string | null>(null);
   const [showExport, setShowExport] = useState(false);
@@ -54,15 +58,28 @@ export default function App() {
 
   useEffect(() => {
     const t = setTimeout(() => setEntered(true), 80);
-    return () => clearTimeout(t);
+    return () => {
+      clearTimeout(t);
+      window.clearTimeout(exitTimer.current);
+    };
   }, []);
 
   const patch = useCallback((p: Partial<Flags>) => setFlags((f) => ({ ...f, ...p })), []);
+  const seek = useCallback((progress: number, settings: Partial<Flags> = {}) => {
+    const p = Math.min(1, Math.max(0, progress));
+    viewer.current?.seek(p);
+    // 操作建造时间轴时离开静态的今日遗存视图。
+    patch({ ...(flags.mode === 'today' && !settings.mode ? { mode: 'solid' as const } : {}), ...settings, progress: p });
+  }, [flags.mode, patch]);
+  const togglePlaying = useCallback(() => {
+    if (flags.progress >= 1) seek(0, { playing: true });
+    else patch({ playing: !flags.playing });
+  }, [flags.playing, flags.progress, patch, seek]);
   const step = useMemo(() => activeStep(flags.progress), [flags.progress]);
   const feature = FEATURES.find((f) => f.id === activeFeature) ?? null;
 
   const onProgress = useCallback((p: number) => {
-    setFlags((f) => (Math.abs(f.progress - p) < 0.012 && p < 1 ? f : { ...f, progress: p }));
+    setFlags((f) => (f.progress === p ? f : { ...f, progress: p }));
   }, []);
   // 只在用户“真的拖动/滚轮改变了机位”时才取消自动运镜；
   // 单纯点击塔身不应把“自动运镜”取消勾选
@@ -76,24 +93,35 @@ export default function App() {
 
   const enterInterior = useCallback(
     (i = 0) => {
+      window.clearTimeout(exitTimer.current);
       setStation(i);
       viewer.current?.enterInterior(i);
-      patch({ mode: 'inside', progress: 1, playing: false, autoCamera: false, autoRotate: false });
+      seek(1, { mode: 'inside', playing: false, autoCamera: false, autoRotate: false });
     },
-    [patch],
+    [seek],
   );
 
   const exitInterior = useCallback(
     (mode: ViewModeId = 'solid') => {
+      window.clearTimeout(exitTimer.current);
       viewer.current?.exitInterior();
       patch({ playing: false, autoCamera: false, autoRotate: false });
       // 等外部外壳淡入的转场播完，再切回外部观察模式（否则会硬切）
-      window.setTimeout(() => patch({ mode, autoRotate: mode === 'solid' }), 1800);
+      exitTimer.current = window.setTimeout(() => patch({ mode, autoRotate: mode === 'solid' && !reducedMotion }), reducedMotion ? 0 : 1800);
     },
-    [patch],
+    [patch, reducedMotion],
   );
 
+  const selectMode = useCallback((mode: ViewModeId) => {
+    if (mode === 'inside') return enterInterior(0);
+    if (isInside) return exitInterior(mode);
+    if (mode === 'solid' || mode === 'today') {
+      seek(1, { mode, playing: false, autoCamera: false });
+    } else patch({ mode });
+  }, [enterInterior, exitInterior, isInside, patch, seek]);
+
   const gotoStation = useCallback((i: number) => {
+    window.clearTimeout(exitTimer.current);
     const next = (i + STATIONS.length) % STATIONS.length;
     setStation(next);
     viewer.current?.gotoStation(next);
@@ -102,26 +130,31 @@ export default function App() {
   /* 键盘 */
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if ((e.target as HTMLElement)?.tagName === 'INPUT') return;
+      const target = e.target;
+      if (e.defaultPrevented || e.metaKey || e.ctrlKey || e.altKey) return;
+      if (target instanceof HTMLElement && (
+        target.isContentEditable || target.closest('input, button, select, textarea, a[href], [role="slider"]')
+      )) return;
       if (e.code === 'Space') {
+        if (isInside) return;
         e.preventDefault();
-        patch({ playing: !flags.playing });
-      } else if (e.key === 'ArrowLeft') patch({ progress: Math.max(0, flags.progress - 0.02), playing: false });
-      else if (e.key === 'ArrowRight') patch({ progress: Math.min(1, flags.progress + 0.02), playing: false });
-      else if (e.key.toLowerCase() === 'r') viewer.current?.resetCamera();
+        if (!e.repeat) togglePlaying();
+      } else if (e.key === 'ArrowLeft' || e.key === 'ArrowRight') {
+        if (isInside) return;
+        e.preventDefault();
+        seek(flags.progress + (e.key === 'ArrowLeft' ? -0.02 : 0.02), { playing: false });
+      } else if (e.key.toLowerCase() === 'r') viewer.current?.resetCamera();
       else if (e.key.toLowerCase() === 'l') patch({ showLabels: !flags.showLabels });
       else if (e.key === 'Escape' && isInside) exitInterior('solid');
       else if (e.key === 'Enter' && !isInside) enterInterior(0);
       else if (['1', '2', '3', '4', '5', '6'].includes(e.key)) {
         const m = VIEW_MODES[+e.key - 1];
-        if (m.id === 'inside') enterInterior(0);
-        else if (isInside) exitInterior(m.id);
-        else patch({ mode: m.id });
+        selectMode(m.id);
       }
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  }, [enterInterior, exitInterior, flags.playing, flags.progress, flags.showLabels, isInside, patch]);
+  }, [enterInterior, exitInterior, flags.progress, flags.showLabels, isInside, patch, seek, selectMode, togglePlaying]);
 
   return (
     <div className="relative h-[100dvh] w-full overflow-hidden bg-[#070a11] text-slate-100 select-none">
@@ -227,15 +260,8 @@ export default function App() {
               <button
                 key={m.id}
                 type="button"
-                onClick={() => {
-                  if (m.id === 'inside') return enterInterior(0);
-                  if (isInside) return exitInterior(m.id);
-                  patch(
-                    m.id === 'solid' || m.id === 'today'
-                      ? { mode: m.id, progress: 1, playing: false, autoCamera: false }
-                      : { mode: m.id },
-                  );
-                }}
+                onClick={() => selectMode(m.id)}
+                aria-pressed={flags.mode === m.id}
                 className={cn(
                   'w-full rounded-lg border px-2.5 py-2 text-left transition',
                   flags.mode === m.id
@@ -265,19 +291,27 @@ export default function App() {
                 {c.label}
               </Btn>
             ))}
+            <Btn className="col-span-2" onClick={() => {
+              const progress = flags.progress < 0.02 || flags.progress > 0.84 ? 0.3 : flags.progress;
+              seek(progress, { mode: 'solid', playing: true, autoCamera: false, autoRotate: false });
+              viewer.current?.focusConstructionSite();
+              setDrawer(false);
+            }}>
+              施工现场 · 近看搬运与凿石
+            </Btn>
           </div>
           <div className="mt-3 flex flex-wrap gap-1.5">
             <IconToggle active={flags.autoRotate} onClick={() => patch({ autoRotate: !flags.autoRotate })} icon="⟳" label="自转" />
             <IconToggle
-              active={flags.mode === 'solid'}
-              onClick={() => patch({ mode: 'solid', progress: 1, playing: false, autoCamera: false })}
+              active={flags.mode === 'solid' && flags.progress >= 1}
+              onClick={() => selectMode('solid')}
               icon="✔"
               label="建成原貌"
               title="约公元前 2560 年落成时：满铺白色外壳 + 镀金顶石"
             />
             <IconToggle
-              active={flags.mode === 'today'}
-              onClick={() => patch({ mode: 'today', progress: 1, playing: false, autoCamera: false })}
+              active={flags.mode === 'today' && flags.progress >= 1}
+              onClick={() => selectMode('today')}
               icon="◲"
               label="今日现状"
               title="今天：外壳剥落、顶石缺失，只见阶梯状石核"
@@ -289,9 +323,38 @@ export default function App() {
               active={flags.rayTracing}
               onClick={() => patch({ rayTracing: !flags.rayTracing })}
               icon="✦"
-              label="光线追踪"
-              title="GTAO 环境光遮蔽 + 泛光，让石缝、棱线与墓室墙角呈现真实接触阴影"
+              label="精细光影"
+              title="实时环境反射、接触阴影与柔和高光"
             />
+          </div>
+          <div className="mt-3">
+            <div className="mb-1.5 flex items-center justify-between text-[10px] text-slate-400">
+              <span>渲染画质</span>
+              <span className="text-slate-500">默认均衡</span>
+            </div>
+            <div className="grid grid-cols-3 gap-1.5" role="group" aria-label="渲染画质">
+              {([
+                { value: 'performance', label: '流畅', hint: '降低分辨率与阴影开销，优先保持顺畅播放' },
+                { value: 'balanced', label: '均衡', hint: '平衡场景细节与播放流畅度' },
+                { value: 'quality', label: '精细', hint: '提高分辨率与阴影细节，适合性能较强的设备' },
+              ] as const).map((quality) => (
+                <button
+                  key={quality.value}
+                  type="button"
+                  title={quality.hint}
+                  aria-pressed={flags.renderQuality === quality.value}
+                  onClick={() => patch({ renderQuality: quality.value })}
+                  className={cn(
+                    'min-h-10 rounded-lg border px-2 py-2 text-[11px] transition-colors',
+                    flags.renderQuality === quality.value
+                      ? 'border-amber-300/60 bg-amber-300/15 text-amber-100'
+                      : 'border-white/10 bg-white/[0.03] text-slate-400 hover:border-white/20 hover:text-slate-200',
+                  )}
+                >
+                  {quality.label}
+                </button>
+              ))}
+            </div>
           </div>
           <div className="mt-3 grid grid-cols-3 gap-1.5">
             <Btn onClick={() => viewer.current?.screenshot()}>📷 截图</Btn>
@@ -308,7 +371,7 @@ export default function App() {
               if (!f) return;
               const res = await viewer.current?.loadGLB(f);
               setGlbInfo({ name: f.name, duration: res?.duration ?? 0, clips: res?.clips ?? [] });
-              patch({ playing: true, progress: 0, autoCamera: false });
+              seek(0, { playing: !reducedMotion, autoCamera: false });
             }}
           />
           <p className="mt-2 text-[10px] leading-relaxed text-slate-500">
@@ -327,7 +390,7 @@ export default function App() {
                   onClick={() => {
                     viewer.current?.clearGLB();
                     setGlbInfo(null);
-                    patch({ progress: 0 });
+                    seek(0);
                   }}
                 >
                   移除
@@ -430,7 +493,17 @@ export default function App() {
             <p className="mt-2 text-[11.5px] leading-relaxed text-slate-300">{feature.desc}</p>
           </Panel>
         )}
-        <Panel className="pointer-events-auto p-3.5">
+        {flags.mode === 'today' ? <Panel className="pointer-events-auto p-3.5">
+          <SectionTitle>今日遗存 · 胡夫金字塔</SectionTitle>
+          <h3 className="text-[13px] font-semibold text-amber-100">外壳散失后的石灰岩石核</h3>
+          <p className="mt-1.5 text-[11.5px] leading-relaxed text-slate-300">
+            塔顶已经缺失，轮廓在顶部收成小平台。裸露石块呈黄褐色，砌层高低不一，边缘风化；白色包覆石仅在基脚少量残存。
+          </p>
+          <div className="mt-2 border-t border-white/5 pt-2 font-mono text-[10.5px] text-slate-400">
+            现高约 137.5 m · 原高 146.6 m · 实景特征近似复原
+          </div>
+          <a className="mt-2 inline-block text-[10px] text-amber-200/70 underline underline-offset-2 hover:text-amber-100" href="https://egymonuments.gov.eg/monuments/the-great-pyramid/" target="_blank" rel="noreferrer">埃及文物部门 · 胡夫金字塔资料 ↗</a>
+        </Panel> : <Panel className="pointer-events-auto p-3.5">
           <SectionTitle>
             工序 {STEPS.findIndex((s) => s.id === step.id) + 1} / {STEPS.length}
           </SectionTitle>
@@ -440,7 +513,7 @@ export default function App() {
           <div className="mt-2 h-1 w-full overflow-hidden rounded-full bg-white/10">
             <div className="h-full rounded-full bg-gradient-to-r from-amber-200 to-amber-500" style={{ width: `${flags.progress * 100}%` }} />
           </div>
-        </Panel>
+        </Panel>}
       </div>
 
       {/* 外部总览：点击金字塔进入内部的提示 */}
@@ -488,7 +561,9 @@ export default function App() {
           <div className="flex flex-wrap items-center gap-3">
             <button
               type="button"
-              onClick={() => patch({ playing: !flags.playing, progress: flags.progress >= 1 ? 0 : flags.progress })}
+              onClick={togglePlaying}
+              aria-label={flags.playing ? '暂停建造动画' : flags.progress >= 1 ? '重新播放建造动画' : '播放建造动画'}
+              title={flags.playing ? '暂停建造动画（空格）' : flags.progress >= 1 ? '重新播放建造动画（空格）' : '播放建造动画（空格）'}
               className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-gradient-to-b from-amber-200 to-amber-500 text-lg text-[#2b1d05] shadow-lg shadow-amber-500/20"
             >
               {flags.playing ? '❚❚' : '▶'}
@@ -499,6 +574,8 @@ export default function App() {
                   key={s}
                   type="button"
                   onClick={() => patch({ speed: s })}
+                  aria-pressed={flags.speed === s}
+                  aria-label={`${s} 倍播放速度`}
                   className={cn(
                     'rounded-md border px-2 py-1 font-mono text-[10.5px] transition',
                     flags.speed === s
@@ -523,40 +600,24 @@ export default function App() {
               </span>
             )}
             <div className="ml-auto flex items-center gap-2 text-[10.5px] text-slate-400">
-              <span className="hidden sm:inline">空格 播放/暂停 · ←→ 逐帧 · 1–5 视图 · R 复位</span>
-              <span className="font-mono text-slate-200">{(flags.progress * 100).toFixed(0)}%　{(flags.progress * 24).toFixed(1)} s</span>
+              <span className="hidden sm:inline">空格 播放/暂停 · ←→ 调整进度 · 1–6 视图 · R 复位</span>
+              <span className="font-mono tabular-nums text-slate-200">{(flags.progress * 100).toFixed(0)}%　{(flags.progress * (glbInfo?.duration || 24)).toFixed(1)} s</span>
             </div>
           </div>
 
           {/* 小屏工序说明 */}
           <div className="mt-2 flex items-baseline gap-2 xl:hidden">
             <span className="shrink-0 rounded-md bg-amber-300/15 px-1.5 py-0.5 text-[10px] text-amber-100">
-              {step.label}
+              {flags.mode === 'today' ? '今日遗存' : step.label}
             </span>
-            <span className="truncate text-[11px] text-slate-300">{step.title}</span>
-            <span className="ml-auto hidden truncate font-mono text-[10px] text-slate-500 sm:block">{step.metric}</span>
+            <span className="truncate text-[11px] text-slate-300">{flags.mode === 'today' ? '风化石核、缺失塔顶与基脚残存外壳' : step.title}</span>
+            <span className="ml-auto hidden truncate font-mono text-[10px] text-slate-500 sm:block">{flags.mode === 'today' ? '现高约 137.5 m · 近似复原' : step.metric}</span>
           </div>
 
           {/* 工序分段条 */}
           <div className="relative mt-3 h-9">
             <div
-              className="absolute inset-0 top-2 h-5 cursor-pointer overflow-hidden rounded-full border border-white/10 bg-white/[0.03]"
-              onPointerDown={(e) => {
-                const el = e.currentTarget;
-                const rect = el.getBoundingClientRect();
-                const move = (clientX: number) => {
-                  const p = Math.min(1, Math.max(0, (clientX - rect.left) / rect.width));
-                  patch({ progress: p, playing: false });
-                };
-                move(e.clientX);
-                const onMove = (ev: PointerEvent) => move(ev.clientX);
-                const onUp = () => {
-                  window.removeEventListener('pointermove', onMove);
-                  window.removeEventListener('pointerup', onUp);
-                };
-                window.addEventListener('pointermove', onMove);
-                window.addEventListener('pointerup', onUp);
-              }}
+              className="pointer-events-none absolute inset-0 top-2 h-5 overflow-hidden rounded-full border border-white/10 bg-white/[0.03]"
             >
               {STEPS.map((s, i) => (
                 <div
@@ -577,6 +638,18 @@ export default function App() {
                 </div>
               ))}
             </div>
+            <input
+              type="range"
+              min={0}
+              max={1}
+              step={0.001}
+              value={flags.progress}
+              aria-label="建造进度"
+              aria-valuetext={`${(flags.progress * 100).toFixed(1)}%，${step.title}`}
+              className="timeline-slider absolute inset-0 z-10 h-9 w-full cursor-ew-resize touch-none"
+              onPointerDown={() => patch({ playing: false })}
+              onChange={(e) => seek(Number(e.currentTarget.value), { playing: false })}
+            />
             <div
               className="pointer-events-none absolute top-0 bottom-0 w-px bg-amber-200 shadow-[0_0_10px_rgba(252,211,77,.9)]"
               style={{ left: `${flags.progress * 100}%` }}
@@ -594,8 +667,9 @@ export default function App() {
                 key={s.id}
                 type="button"
                 onClick={() => {
-                  patch({ progress: s.from + 0.002, playing: true, autoCamera: true });
+                  seek(s.from + 0.002, { playing: true, autoCamera: !reducedMotion });
                 }}
+                aria-pressed={s.id === step.id}
                 className={cn(
                   'shrink-0 rounded-md border px-2 py-1 text-[10.5px] whitespace-nowrap transition',
                   s.id === step.id
@@ -624,7 +698,7 @@ export default function App() {
         <div className="text-2xl">🔺</div>
         <p className="text-sm tracking-[0.3em] text-amber-200">KHUFU · 2560 B.C.</p>
         <p className="text-xs text-slate-400">
-          正在构建 3D 场景：230 万块石材 / 60 层砌体 / 11 处内部结构
+          正在构建 3D 场景：分层砌筑 / 11 处内部结构
         </p>
         <p className="text-[11px] text-slate-500">点击金字塔即可进入内部，在真实尺度的通道与墓室中漫游</p>
       </div>

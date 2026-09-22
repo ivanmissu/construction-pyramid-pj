@@ -2,7 +2,9 @@ import { forwardRef, useEffect, useImperativeHandle, useRef } from 'react';
 import { KhufuViewer, type ViewerFlags } from '../scene/khufu';
 
 export type ViewerHandle = {
+  seek: (progress: number) => void;
   focusFeature: (id: string) => void;
+  focusConstructionSite: () => void;
   resetCamera: () => void;
   screenshot: () => void;
   loadGLB: (file: File) => Promise<{ duration: number; clips: string[] }>;
@@ -35,9 +37,12 @@ const Viewer = forwardRef<ViewerHandle, Props>(function Viewer(
     if (!canvasRef.current || viewerRef.current) return;
     const v = new KhufuViewer(canvasRef.current, (p) => cbRef.current.onProgress(p));
     viewerRef.current = v;
+    v.onPlayingChange = (playing) => cbRef.current.onPlayingChange(playing);
+    v.onCameraControl = () => cbRef.current.onUserInteract();
     v.onEnterRequest = () => cbRef.current.onEnter();
     if (hostRef.current) v.attachLabels(hostRef.current);
     v.setFlags(flags);
+    v.setProgress(flags.progress);
     const ro = new ResizeObserver(() => v.resize());
     if (canvasRef.current.parentElement) ro.observe(canvasRef.current.parentElement);
     // 只有当用户真正“拖动/滚轮改变机位”时才取消自动运镜；
@@ -76,9 +81,7 @@ const Viewer = forwardRef<ViewerHandle, Props>(function Viewer(
     const prev = prevFlags.current;
     prevFlags.current = flags;
     // 播放中进度由 3D 循环推进，避免每帧 setFlags → 触发 React 全树对照
-    const onlyProgress =
-      flags.playing &&
-      flags.progress !== prev.progress &&
+    const settingsUnchanged =
       flags.mode === prev.mode &&
       flags.speed === prev.speed &&
       flags.autoCamera === prev.autoCamera &&
@@ -86,13 +89,20 @@ const Viewer = forwardRef<ViewerHandle, Props>(function Viewer(
       flags.wireframe === prev.wireframe &&
       flags.showLabels === prev.showLabels &&
       flags.showEdges === prev.showEdges &&
-      flags.rayTracing === prev.rayTracing;
-    if (!onlyProgress) v.setFlags(flags);
-    v.setPlaying(flags.playing, flags.speed);
+      flags.rayTracing === prev.rayTracing &&
+      flags.renderQuality === prev.renderQuality &&
+      flags.playing === prev.playing;
+    // 进度回报只更新界面；用户跳转通过 seek 单独送入场景，避免旧进度回写。
+    if (!settingsUnchanged) v.setFlags(flags);
+    if (flags.playing !== prev.playing || flags.speed !== prev.speed) {
+      v.setPlaying(flags.playing, flags.speed);
+    }
   }, [flags]);
 
   useImperativeHandle(ref, () => ({
+    seek: (progress) => viewerRef.current?.setProgress(progress),
     focusFeature: (id) => viewerRef.current?.focusFeature(id),
+    focusConstructionSite: () => viewerRef.current?.focusConstructionSite(),
     resetCamera: () => viewerRef.current?.resetCamera(),
     screenshot: () => {
       const v = viewerRef.current;

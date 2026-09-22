@@ -31,6 +31,7 @@ export function IconToggle({
     <button
       type="button"
       title={title ?? label}
+      aria-pressed={active}
       onClick={onClick}
       className={cn(
         'flex items-center gap-1.5 rounded-lg border px-2 py-1.5 text-[11px] font-medium transition',

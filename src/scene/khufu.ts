@@ -1,12 +1,11 @@
 import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
-import { EffectComposer } from 'three/examples/jsm/postprocessing/EffectComposer.js';
-import { RenderPass } from 'three/examples/jsm/postprocessing/RenderPass.js';
-import { GTAOPass } from 'three/examples/jsm/postprocessing/GTAOPass.js';
-import { UnrealBloomPass } from 'three/examples/jsm/postprocessing/UnrealBloomPass.js';
-import { OutputPass } from 'three/examples/jsm/postprocessing/OutputPass.js';
-import { SMAAPass } from 'three/examples/jsm/postprocessing/SMAAPass.js';
+import { KhufuRenderPipeline, createDesertEnvironment, type RenderQuality } from './renderPipeline';
+import { createStoneTexture } from './stoneTexture';
+import { buildConstructionWorkers } from './workers';
+import { createOpenPassageGeometry } from './openPassageGeometry';
+import { buildTodayExterior } from './todayExterior';
 import { DIMS, FEATURES, STATIONS, STEPS, type ViewModeId } from '../data/reference';
 import {
   buildGrandGalleryDetail,
@@ -37,7 +36,7 @@ const easeOutCubic = (t: number) => 1 - Math.pow(1 - clamp01(t), 3);
 /**
  * 逐块砌石系统：金字塔不是“一层层”出现的，而是一块块大石头依次砌上去的。
  * 每一道砌层 = 四条边 × 每边若干块大石（相邻层错缝搭接），
- * 每块石头都有独立的“砌筑时刻”，建造动画按块逐次弹出。
+ * 每块石头都有独立的“砌筑时刻”，在本层高度连续落位。
  */
 export type BlockSystem = {
   insts: THREE.InstancedMesh[]; // 每道砌层一个 InstancedMesh（外圈石块）
@@ -49,7 +48,7 @@ export type BlockSystem = {
   seams: THREE.Mesh[]; // 贴在平整外壳上的细密石缝带
   fillStarts: Float32Array; // 每道填充层的升起时刻
   fillDur: number;
-  dur: number; // 单块弹出时长
+  dur: number; // 单块落位时长
   nCourses: number;
   blocksPerSide: number;
   /** 该层全部石块已砌完且矩阵已写入终态，后续帧可跳过 */
@@ -58,7 +57,7 @@ export type BlockSystem = {
   lastP: number;
 };
 
-function buildBlockCourses(
+export function buildBlockCourses(
   parent: THREE.Object3D,
   mat: THREE.MeshStandardMaterial,
   nCourses: number,
@@ -73,10 +72,13 @@ function buildBlockCourses(
   fixedDepth = 0, // 指定石块厚度（外壳为薄贴面），0 = 自动
 ): BlockSystem {
   const layerH = HEIGHT / nCourses;
-  // 每道砌层 = 4 面 × blocksPerSide 块 + 4 个 45° 磨角块（压住棱线，使交接处平整）
-  const perCourse = blocksPerSide * 4 + 4;
+  // 棱角由填充棱台补齐，时间轴只统计实际绘制的面石块。
+  const perCourse = blocksPerSide * 4;
   const count = nCourses * perCourse;
-  const step = (endFrac - startFrac) / Math.max(1, count - 1);
+  const span = endFrac - startFrac;
+  // 为最后一块预留落位时间；高速播放时仍有数帧连续运动。
+  const dur = Math.min(span * 0.25, Math.max(0.012, (span / Math.max(1, count - 1)) * 6.5));
+  const step = (span - dur) / Math.max(1, count - 1);
   const qs = [0, Math.PI / 2, Math.PI, -Math.PI / 2];
   const tmpQ = new THREE.Quaternion();
   const slopeSin = Math.sin(tilt);
@@ -169,8 +171,15 @@ function buildBlockCourses(
         quat[k * 4 + 2] = tmpQ.z;
         quat[k * 4 + 3] = tmpQ.w;
         stt[k] = startFrac + (seqCourse * perCourse + s * blocksPerSide + j) * step;
+        scratchPosition.fromArray(pos, k * 3);
+        scratchScale.set(1, 1, 1);
+        scratchM.compose(scratchPosition, tmpQ, scratchScale);
+        inst.setMatrixAt(k, scratchM);
       }
     }
+    // 提前用完整砌层求剔除边界，避免首次只出现一块时锁定过小的包围球。
+    inst.computeBoundingSphere();
+    if (inst.boundingSphere) inst.boundingSphere.radius += 0.05;
     positions.push(pos);
     quats.push(quat);
     starts.push(stt);
@@ -278,8 +287,8 @@ function buildBlockCourses(
     fills,
     seams,
     fillStarts,
-    fillDur: step * perCourse * 1.1,
-    dur: step * 6.5,
+    fillDur: Math.max(dur, step * (perCourse - 1) + dur),
+    dur,
     sloped: tilt > 0,
     nCourses,
     blocksPerSide,
@@ -291,51 +300,64 @@ function buildBlockCourses(
 
 const scratchM = new THREE.Matrix4();
 const scratchQ = new THREE.Quaternion();
+const scratchPosition = new THREE.Vector3();
+const scratchScale = new THREE.Vector3();
 
-/** 按时间轴进度更新整个砌石系统（每块独立弹出） */
-function updateBlocks(sys: BlockSystem, p: number, keepCourse?: (course: number) => boolean) {
+/** 按时间轴进度连续落位；只为正在变化的砌层上传实例矩阵。 */
+export function updateBlocks(sys: BlockSystem, p: number, keepCourse?: (course: number) => boolean) {
+  p = clamp01(p);
   for (let c = 0; c < sys.nCourses; c++) {
+    const inst = sys.insts[c];
+    const fill = sys.fills[c];
+    const seam = sys.seams[c];
+    const stt = sys.starts[c];
+    const n = stt.length;
     const keep = !keepCourse || keepCourse(c);
-    if (!keep) {
-      // 整道砌层不可见（如“今日现状”的外壳只剩顶部几层）
-      for (let k = 0; k < sys.blocksPerSide * 4; k++) {
-        scratchM.makeScale(0.0001, 0.0001, 0.0001);
-        sys.insts[c].setMatrixAt(k, scratchM);
-      }
-      sys.insts[c].instanceMatrix.needsUpdate = true;
-      sys.insts[c].count = 0;
-      sys.fills[c].scale.y = 0.0001;
-      sys.seams[c].visible = false;
+    if (!keep || p <= stt[0]) {
+      // 通过绘制数量隐藏，保留矩阵缓存；过滤模式不会留下薄薄的一整层填充。
+      inst.count = 0;
+      fill.visible = false;
+      seam.visible = false;
+      sys.hidden[c] = 1;
       continue;
     }
-    // 实体填充随该层砌筑升起（比石块稍早，掩住内侧）。y 缩放不能改 xz，否则棱台穿出塔面。
+    const wasHidden = sys.hidden[c] === 1;
+    sys.hidden[c] = 0;
+    // 实体填充始终锚定本层底部；仅沿 y 生长，避免棱台穿出塔面。
     const fl = smooth((p - sys.fillStarts[c]) / sys.fillDur);
-    sys.fills[c].scale.set(1, Math.max(0.0008, fl), 1);
-    sys.fills[c].visible = p >= sys.fillStarts[c] - 0.0001;
-    sys.seams[c].visible = p >= sys.fillStarts[c] + sys.fillDur * 0.55;
+    fill.scale.set(1, fl, 1);
+    fill.visible = true;
+    seam.visible = sys.sloped && p >= sys.fillStarts[c] + sys.fillDur * 0.55;
+
+    const complete = p >= stt[n - 1] + sys.dur;
+    if (complete && sys.settled[c]) {
+      inst.count = n;
+      continue;
+    }
+    if (!wasHidden && p === sys.lastP) continue;
+
     const pos = sys.positions[c];
     const quat = sys.quats[c];
-    const stt = sys.starts[c];
-    const n = sys.blocksPerSide * 4;
     let builtCount = 0;
     for (let k = 0; k < n; k++) {
-      const local = p >= stt[k] ? easeOutCubic((p - stt[k]) / sys.dur) : 0;
-      const sc = Math.max(0.0008, local);
-      const drop = (1 - local) * (1 - local) * 0.035;
+      if (p <= stt[k]) break;
+      const local = easeOutCubic((p - stt[k]) / sys.dur);
+      const drop = (1 - local) * (1 - local) * Math.min(0.045, (HEIGHT / sys.nCourses) * 0.12);
       scratchQ.set(quat[k * 4], quat[k * 4 + 1], quat[k * 4 + 2], quat[k * 4 + 3]);
-      scratchM.makeRotationFromQuaternion(scratchQ);
-      // 沿“坡向上”局部 y 缩放。注意：贴面石块只在自己面的局部 y 方向伸展。
-      scratchM.elements[0] *= 1;
-      scratchM.elements[5] *= sc;
-      scratchM.elements[10] *= 1;
-      // 位置分量也按该轴缩放，保留石块底面 y 锚点（沿坡向上长出，不向塔内塌陷）。
-      scratchM.setPosition(pos[k * 3], pos[k * 3 + 1] * sc + drop, pos[k * 3 + 2]);
-      sys.insts[c].setMatrixAt(k, scratchM);
-      if (sc > 0.5) builtCount = k + 1;
+      scratchPosition.set(pos[k * 3], pos[k * 3 + 1] + drop, pos[k * 3 + 2]);
+      scratchScale.set(1, Math.max(0.00001, local), 1);
+      // compose 缩放完整的局部基向量，保留坡面旋转和本层的世界高度。
+      scratchM.compose(scratchPosition, scratchQ, scratchScale);
+      inst.setMatrixAt(k, scratchM);
+      builtCount = k + 1;
     }
-    sys.insts[c].count = builtCount;
-    sys.insts[c].instanceMatrix.needsUpdate = true;
+    inst.count = builtCount;
+    inst.instanceMatrix.clearUpdateRanges();
+    inst.instanceMatrix.addUpdateRange(0, builtCount * 16);
+    inst.instanceMatrix.needsUpdate = true;
+    sys.settled[c] = complete ? 1 : 0;
   }
+  sys.lastP = p;
 }
 
 /* ------------------------------------------------------------------ 几何工具 */
@@ -477,17 +499,18 @@ export function buildModel(): BuiltScene {
   const extra = new THREE.Group();
   root.add(shell, core, internals, extra);
 
-  const coreMat = new THREE.MeshStandardMaterial({ color: 0xbfae8e, roughness: 0.98, metalness: 0.0 });
+  const stoneGrain = createStoneTexture();
+  const coreMat = new THREE.MeshStandardMaterial({ color: 0xbfae8e, roughness: 0.98, metalness: 0.0, bumpMap: stoneGrain, bumpScale: 0.012, roughnessMap: stoneGrain });
   // 采石场方料 / 运石雪橇用独立材质，避免随“石核半透明”一起变透明
-  const blockMat = new THREE.MeshStandardMaterial({ color: 0xb8a684, roughness: 1 });
+  const blockMat = new THREE.MeshStandardMaterial({ color: 0xb8a684, roughness: 1, bumpMap: stoneGrain, bumpScale: 0.008 });
   // 真正纯白：图拉石灰岩打磨后的外露本色。
-  const casingMat = new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.42, metalness: 0.02 });
+  const casingMat = new THREE.MeshStandardMaterial({ color: 0xfff9ef, roughness: 0.64, metalness: 0, bumpMap: stoneGrain, bumpScale: 0.003, roughnessMap: stoneGrain });
   const goldMat = new THREE.MeshStandardMaterial({
     color: 0xe8b955,
-    roughness: 0.25,
-    metalness: 0.9,
+    roughness: 0.23,
+    metalness: 0.95,
     emissive: new THREE.Color(0x3a2300),
-    emissiveIntensity: 0.8,
+    emissiveIntensity: 0.12,
   });
 
   /* --- 石核：逐块砌石（每层 = 四边 × 4 块大石，相邻层错缝） --- */
@@ -672,15 +695,16 @@ export function buildModel(): BuiltScene {
     const dir = vb.clone().sub(va);
     const len = dir.length();
     dir.normalize();
-    const right = new THREE.Vector3().crossVectors(dir, up).normalize();
-    const upv = new THREE.Vector3().crossVectors(right, dir).normalize();
+    const right = new THREE.Vector3().crossVectors(up, dir).normalize();
+    const upv = new THREE.Vector3().crossVectors(dir, right).normalize();
     const ringLen = len / ringCount;
     const out: THREE.Mesh[] = [];
     for (let i = 0; i < ringCount; i++) {
       const c = va.clone().addScaledVector(dir, (i + 0.5) * ringLen);
-      const geo = new THREE.BoxGeometry(w * S, h * S, ringLen * S);
+      const geo = createOpenPassageGeometry(w * S, h * S, ringLen * S);
       const mesh = new THREE.Mesh(geo, mat);
-      mesh.position.copy(c).addScaledVector(upv, (h * S) / 2);
+      // 输入轴线与插值中心仍以米计；位置和几何必须使用同一场景比例。
+      mesh.position.copy(c).multiplyScalar(S).addScaledVector(upv, (h * S) / 2);
       mesh.quaternion.setFromRotationMatrix(new THREE.Matrix4().makeBasis(right, upv, dir));
       mesh.castShadow = true;
       mesh.receiveShadow = true;
@@ -729,8 +753,8 @@ export function buildModel(): BuiltScene {
     const dir = vb.clone().sub(va);
     const len = dir.length();
     dir.normalize();
-    const right = new THREE.Vector3().crossVectors(dir, up).normalize();
-    const upv = new THREE.Vector3().crossVectors(right, dir).normalize();
+    const right = new THREE.Vector3().crossVectors(up, dir).normalize();
+    const upv = new THREE.Vector3().crossVectors(dir, right).normalize();
     // 几何沿 +local z 平移半长，使枢轴落在起点 a；这样对 local z 做缩放时
     // 通道会沿 a→b 方向“掘进生长”，而不是从中点向两侧膨胀
     const geo = new THREE.BoxGeometry(w * S, h * S, len);
@@ -992,6 +1016,8 @@ export function buildModel(): BuiltScene {
   const blockGeo = new THREE.BoxGeometry(0.22, 0.16, 0.28);
   const blockCount = 160;
   const blocks = new THREE.InstancedMesh(blockGeo, blockMat, blockCount);
+  blocks.name = '施工场待用石料';
+  blocks.position.y = -0.32;
   const m4 = new THREE.Matrix4();
   const q = new THREE.Quaternion();
   const scl = new THREE.Vector3();
@@ -1003,7 +1029,7 @@ export function buildModel(): BuiltScene {
   for (let i = 0; i < blockCount; i++) {
     const ang = rand() * Math.PI * 2;
     // 只在塔基四周的施工场（半径 14–21 场景单位 ≈ 140–210 m）堆放石料
-    const rad = HALF + 2.5 + rand() * 7;
+    const rad = (HALF + 2.5) / Math.max(Math.abs(Math.cos(ang)), Math.abs(Math.sin(ang))) + rand() * 4;
     if (i % 3 === 0) {
       // 施工场上的方料堆（成排码放）
       m4.compose(
@@ -1018,6 +1044,7 @@ export function buildModel(): BuiltScene {
         scl.set(0.7 + rand() * 1.2, 0.7 + rand() * 0.6, 0.7 + rand() * 0.8),
       );
     }
+    m4.elements[13] = 0.08 * scl.y;
     blocks.setMatrixAt(i, m4);
   }
   blocks.castShadow = true;
@@ -1099,8 +1126,9 @@ export type ViewerFlags = {
   wireframe: boolean;
   showLabels: boolean;
   showEdges: boolean;
-  /** 光线追踪式渲染（GTAO 环境光遮蔽 + 泛光 + SMAА 抗锯齿） */
+  /** 实时接触阴影、环境反射与柔和高光。 */
   rayTracing: boolean;
+  renderQuality: RenderQuality;
 };
 
 export type LabelInfo = { id: string; name: string; color: string; x: number; y: number; alpha: number };
@@ -1113,8 +1141,9 @@ export class KhufuViewer {
   private scene = new THREE.Scene();
   private camera: THREE.PerspectiveCamera;
   private controls: OrbitControls;
-  private clock = new THREE.Clock();
+  private clock = new THREE.Timer();
   private built: BuiltScene;
+  private workers: ReturnType<typeof buildConstructionWorkers>;
   private raf = 0;
   private progress = 0;
   private flags: ViewerFlags = {
@@ -1128,6 +1157,7 @@ export class KhufuViewer {
     showLabels: true,
     showEdges: true,
     rayTracing: true,
+    renderQuality: 'balanced',
   };
   private labelHost: HTMLDivElement | null = null;
   private labelEls = new Map<string, HTMLDivElement>();
@@ -1135,6 +1165,8 @@ export class KhufuViewer {
   /** 点击金字塔进入内部 的回调（由 React 层接管 UI 状态） */
   onEnterRequest?: () => void;
   onExitRequest?: () => void;
+  onPlayingChange?: (playing: boolean) => void;
+  onCameraControl?: () => void;
   /* --- 进入 / 退出内部的转场状态 --- */
   private phase: 'exterior' | 'interior' = 'exterior';
   private curStation = 0;
@@ -1149,15 +1181,19 @@ export class KhufuViewer {
   private pointer = new THREE.Vector2();
   private downPos = { x: 0, y: 0 };
   private hoverEnter = false;
-  private focusAnim: { pos: THREE.Vector3; target: THREE.Vector3; t: number } | null = null;
+  private focusAnim: { pos: THREE.Vector3; target: THREE.Vector3; fromPos: THREE.Vector3; fromTarget: THREE.Vector3; t: number } | null = null;
+  private inputCleanup: (() => void) | null = null;
+  private readonly reducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  private readonly autoPosition = new THREE.Vector3();
+  private readonly autoTarget = new THREE.Vector3();
   private glbGroup = new THREE.Group();
   private mixer: THREE.AnimationMixer | null = null;
   private glbDuration = 1;
   private capstoneAllowed = true;
   private todayMode = false;
-  private composer!: EffectComposer;
-  private gtaoPass!: GTAOPass;
-  private bloomPass!: UnrealBloomPass;
+  private todayExterior: ReturnType<typeof buildTodayExterior> | null = null;
+  private pipeline!: KhufuRenderPipeline;
+  private environment!: ReturnType<typeof createDesertEnvironment>;
   private beacon!: THREE.Mesh;
   private beaconLight!: THREE.PointLight;
   private beaconPulse = 0;
@@ -1188,6 +1224,7 @@ export class KhufuViewer {
   constructor(canvas: HTMLCanvasElement, onProgress?: (p: number) => void) {
     this.canvas = canvas;
     this.onProgress = onProgress;
+    this.clock.connect(document);
     this.renderer = new THREE.WebGLRenderer({
       canvas,
       antialias: true,
@@ -1197,15 +1234,16 @@ export class KhufuViewer {
     });
     this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
     this.renderer.shadowMap.enabled = true;
-    this.renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+    this.renderer.shadowMap.type = THREE.PCFShadowMap;
     // 阴影图只在几何/太阳变化时重绘，静止观景时冻结（观感不变，省掉每帧一次 2048 阴影通道）
     this.renderer.shadowMap.autoUpdate = false;
     this.renderer.toneMapping = THREE.ACESFilmicToneMapping;
-    this.renderer.toneMappingExposure = 1.05;
+    this.renderer.toneMappingExposure = 1.0;
+    this.renderer.outputColorSpace = THREE.SRGBColorSpace;
     this.renderer.localClippingEnabled = true;
 
-    // 近裁剪面要足够小（0.3 m），才能站进 1 m 宽的通道内部而不被裁掉墙面
-    this.camera = new THREE.PerspectiveCamera(48, 1, 0.03, 1300);
+    // 窄廊只宽约 1 m，近裁剪面收至 6 cm（模型单位 0.006）。
+    this.camera = new THREE.PerspectiveCamera(48, 1, 0.006, 1300);
     this.controls = new OrbitControls(this.camera, canvas);
     this.controls.enableDamping = true;
     this.controls.dampingFactor = 0.07;
@@ -1215,6 +1253,8 @@ export class KhufuViewer {
     this.controls.target.set(0, HEIGHT * 0.35, 0);
 
     this.built = buildModel();
+    this.workers = buildConstructionWorkers();
+    this.built.extra.add(this.workers.group);
     this.scene.add(this.built.root, this.glbGroup);
 
     // 内部漫游头灯：跟随相机，仅在钻入塔内时点亮
@@ -1253,6 +1293,8 @@ export class KhufuViewer {
             float h = normalize(vPos).y;
             vec3 c = h > 0.0 ? mix(mid, top, pow(h, 0.7)) : mix(mid, bot, pow(-h, 0.5));
             gl_FragColor = vec4(c, 1.0);
+            #include <tonemapping_fragment>
+            #include <colorspace_fragment>
           }`,
       }),
     );
@@ -1274,8 +1316,9 @@ export class KhufuViewer {
     this.sun.shadow.camera.near = 1;
     this.sun.shadow.camera.far = 220;
     this.sun.shadow.camera.updateProjectionMatrix();
-    this.sun.shadow.bias = -0.0009;
-    this.sun.shadow.normalBias = 0.02;
+    this.sun.shadow.bias = -0.00015;
+    this.sun.shadow.normalBias = 0.035;
+    this.sun.shadow.radius = 2.5;
     // 影子朝向塔体中心，随太阳绕动保持对准
     this.sun.target.position.set(0, 6, 0);
     this.scene.add(this.sun);
@@ -1284,45 +1327,10 @@ export class KhufuViewer {
     bounce.position.set(-24, 8, -20);
     this.scene.add(bounce);
 
-    // ---- 光线追踪式后处理：MSAA + GTAO（真实接触阴影/环境光遮蔽）+ 泛光 + 色调映射 + 抗锯齿
-    {
-      const w = Math.max(1, canvas.clientWidth);
-      const h = Math.max(1, canvas.clientHeight);
-      const rt = new THREE.WebGLRenderTarget(w, h, {
-        type: THREE.HalfFloatType,
-        samples: 4, // 4× MSAA
-      });
-      this.composer = new EffectComposer(this.renderer, rt);
-      this.composer.setPixelRatio(Math.min(window.devicePixelRatio, 1.25));
-      this.composer.addPass(new RenderPass(this.scene, this.camera));
-
-      // GTAO：逐像素计算的环境光遮蔽，等效于一次“光线追踪”的间接光遮蔽，
-      // 让石缝、棱线、墓室墙角都有真实接触阴影
-      this.gtaoPass = new GTAOPass(this.scene, this.camera, w, h);
-      this.gtaoPass.output = GTAOPass.OUTPUT.Default;
-      this.gtaoPass.blendIntensity = 0.85;
-      this.gtaoPass.updateGtaoMaterial({
-        radius: 1.1,
-        distanceExponent: 1.2,
-        thickness: 1.0,
-        scale: 1.0,
-        samples: 12,
-        distanceFallOff: 1.0,
-        screenSpaceRadius: false,
-      });
-      this.gtaoPass.updatePdMaterial({ lumaPhi: 10, depthPhi: 2, normalPhi: 3, radius: 4, radiusExponent: 1, rings: 2, samples: 16 });
-      this.composer.addPass(this.gtaoPass);
-
-      // 泛光：给镀金顶石与阳光高光一点真实的溢出感
-      // 强度/半径/阈值都压低，让“太阳”高光区域更小、更集中（约为之前的 1/2）
-      this.bloomPass = new UnrealBloomPass(new THREE.Vector2(w, h), 0.16, 0.45, 0.96);
-      this.composer.addPass(this.bloomPass);
-
-      const smaa = new SMAAPass();
-      this.composer.addPass(smaa);
-      this.composer.addPass(new OutputPass());
-      this.composer.setSize(w, h);
-    }
+    this.environment = createDesertEnvironment(this.renderer);
+    this.scene.environment = this.environment.texture;
+    this.scene.environmentIntensity = 0.45;
+    this.pipeline = new KhufuRenderPipeline(this.renderer, this.scene, this.camera, this.flags.renderQuality);
 
     this.autoCameraUpdate(0);
     this.applyMode();
@@ -1343,7 +1351,10 @@ export class KhufuViewer {
     this.pointer.x = ((clientX - r.left) / r.width) * 2 - 1;
     this.pointer.y = -((clientY - r.top) / r.height) * 2 + 1;
     this.ray.setFromCamera(this.pointer, this.camera);
-    const targets: THREE.Object3D[] = [this.built.shell, this.built.core, this.built.capstone, this.built.internals];
+    // Hover tests use the compact solid backing, not tens of thousands of worn stones.
+    const targets: THREE.Object3D[] = this.todayMode && this.todayExterior
+      ? [this.todayExterior.backing]
+      : [this.built.shell, this.built.core, this.built.capstone, this.built.internals];
     const hits = this.ray.intersectObjects(targets, true);
     return hits.find((h) => (h.object as THREE.Mesh).isMesh) ?? null;
   }
@@ -1360,6 +1371,7 @@ export class KhufuViewer {
 
   private attachPointer() {
     const onMove = (e: PointerEvent) => {
+      if (e.buttons) return;
       if (!this.canClickEnter()) {
         if (this.hoverEnter) {
           this.hoverEnter = false;
@@ -1375,16 +1387,25 @@ export class KhufuViewer {
     };
     const onDown = (e: PointerEvent) => {
       this.downPos = { x: e.clientX, y: e.clientY };
+      this.focusAnim = null;
     };
     const onUp = (e: PointerEvent) => {
       const moved = Math.hypot(e.clientX - this.downPos.x, e.clientY - this.downPos.y);
-      if (moved > 6 || !this.canClickEnter()) return;
+      if (e.button !== 0 || moved > 6 || !this.canClickEnter()) return;
       if (!this.pickPyramid(e.clientX, e.clientY)) return;
       this.onEnterRequest?.();
     };
     this.canvas.addEventListener('pointermove', onMove);
     this.canvas.addEventListener('pointerdown', onDown);
     this.canvas.addEventListener('pointerup', onUp);
+    const onWheel = () => { this.focusAnim = null; };
+    this.canvas.addEventListener('wheel', onWheel, { passive: true });
+    this.inputCleanup = () => {
+      this.canvas.removeEventListener('pointermove', onMove);
+      this.canvas.removeEventListener('pointerdown', onDown);
+      this.canvas.removeEventListener('pointerup', onUp);
+      this.canvas.removeEventListener('wheel', onWheel);
+    };
   }
 
   /* ------------------------------------------------- 进入 / 退出 / 站点巡检 */
@@ -1393,6 +1414,15 @@ export class KhufuViewer {
   }
 
   startPath(keys: PathKey[]) {
+    if (this.reducedMotion && keys.length) {
+      const last = keys[keys.length - 1];
+      this.camera.position.copy(last.pos);
+      this.controls.target.copy(last.target);
+      this.focusAnim = null;
+      this.path = null;
+      this.controls.enabled = true;
+      return;
+    }
     this.path = keys;
     this.pathIdx = 0;
     this.pathT = 0;
@@ -1422,6 +1452,12 @@ export class KhufuViewer {
   }
 
   private animateEnter(to: number, dur = 1.6) {
+    if (this.reducedMotion) {
+      this.enterT = to;
+      this.enterAnim = null;
+      this.applyShellFade();
+      return;
+    }
     this.enterAnim = { from: this.enterT, to, t: 0, dur };
   }
 
@@ -1463,7 +1499,10 @@ export class KhufuViewer {
     if (!st) return;
     this.curStation = station;
     this.phase = 'interior';
-    if (this.enterT < 0.99) this.animateEnter(1, 1.2);
+    this.controls.minDistance = 0.35;
+    this.controls.maxDistance = 60;
+    this.controls.maxPolarAngle = Math.PI * 0.97;
+    if (this.enterT < 0.99 || this.enterAnim?.to === 0) this.animateEnter(1, 1.2);
     this.startPath([{ pos: this.vec(st.pos), target: this.vec(st.target), dur: 1.15 }]);
   }
 
@@ -1474,17 +1513,17 @@ export class KhufuViewer {
   /* --------------------------------------------------------- 状态 */
   setFlags(partial: Partial<ViewerFlags>) {
     const prevMode = this.flags.mode;
+    const prevEdges = this.flags.showEdges;
+    const prevQuality = this.flags.renderQuality;
     Object.assign(this.flags, partial);
-    if (partial.mode !== undefined && partial.mode !== prevMode) this.applyMode();
+    const modeChanged = partial.mode !== undefined && partial.mode !== prevMode;
+    const edgesChanged = partial.showEdges !== undefined && partial.showEdges !== prevEdges;
+    if (modeChanged || edgesChanged) this.applyMode();
     if (partial.wireframe !== undefined) {
       const wf = partial.wireframe;
       this.built.casingMat.wireframe = wf;
       this.built.coreMat.wireframe = wf;
-    }
-    if (partial.showEdges !== undefined) {
-      this.built.coreEdges.visible = partial.showEdges;
-      this.built.casingEdges.visible = partial.showEdges;
-      this.applyMode(); // 轮廓线可见性由 applyMode 统一决定
+      this.todayExterior?.materials.forEach((material) => { material.wireframe = wf; });
     }
     if (partial.showLabels !== undefined && this.labelHost) {
       this.labelHost.style.opacity = partial.showLabels ? '1' : '0';
@@ -1494,10 +1533,16 @@ export class KhufuViewer {
       this.controls.autoRotateSpeed = 0.6;
     }
     if (partial.rayTracing !== undefined) this.setRayTracing(partial.rayTracing);
-    // 播放中由查看器自己推进时间轴，只在外部大幅跳转（拖动/工序跳转）时覆盖
-    if (partial.progress !== undefined && (!this.flags.playing || Math.abs(this.progress - partial.progress) > 0.05)) {
-      this.applyProgress(partial.progress);
+    if (partial.renderQuality && partial.renderQuality !== prevQuality) {
+      this.pipeline.setQuality(partial.renderQuality);
+      const shadowSize = partial.renderQuality === 'quality' ? 4096 : partial.renderQuality === 'performance' ? 1024 : 2048;
+      this.sun.shadow.mapSize.set(shadowSize, shadowSize);
+      this.sun.shadow.map?.dispose();
+      this.sun.shadow.map = null;
+      this.renderer.shadowMap.needsUpdate = true;
     }
+    // React 的 progress 是节流后的显示值；用户跳转通过 setProgress 显式发送，
+    // 避免暂停、切换画质或标签时把动画倒退到上一条 UI 报告。
   }
 
   setProgress(p: number) {
@@ -1573,7 +1618,9 @@ export class KhufuViewer {
     const vis = this.enterT < 0.985 && this.flags.mode !== 'interior';
     this.built.shell.visible = vis;
     this.built.casingMat.opacity = Math.max(0, 1 - this.enterT);
-    this.built.casingMat.transparent = this.built.casingMat.opacity < 0.999;
+    // Keep one compositing path during the whole fade, including opacity=1.
+    this.built.casingMat.transparent = true;
+    this.built.casingMat.depthWrite = true;
     this.built.casingSys.insts.forEach((m) => (m.castShadow = this.enterT < 0.5));
     this.built.casingSys.fills.forEach((m) => (m.castShadow = this.enterT < 0.5));
     this.built.casingEdges.visible = false;
@@ -1593,11 +1640,17 @@ export class KhufuViewer {
     this.built.casingMat.needsUpdate = true;
 
     // 外壳组显隐（进入内部时由 enterT 转场接管）
-    this.built.shell.visible = mode !== 'interior';
+    if (mode === 'today' && !this.todayExterior) {
+      this.todayExterior = buildTodayExterior();
+      this.todayExterior.materials.forEach((material) => { material.wireframe = this.flags.wireframe; });
+      this.built.root.add(this.todayExterior.group);
+    }
+    if (this.todayExterior) this.todayExterior.group.visible = mode === 'today';
+    this.built.shell.visible = mode !== 'interior' && mode !== 'today';
     if (inside) {
       this.built.shell.visible = this.enterT < 0.985;
       this.built.casingMat.opacity = Math.max(0, 1 - this.enterT);
-      this.built.casingMat.transparent = this.enterT > 0.001;
+      this.built.casingMat.transparent = true;
     } else if (this.fadeInit) {
       // 从当前外壳不透明度起继续淡入淡出，避免模式切换瞬间跳变
       this.casingOpCur = this.built.casingMat.opacity;
@@ -1610,7 +1663,7 @@ export class KhufuViewer {
     this.built.coreEdges.visible = false;
 
     // 地面组显隐；补块 / 基坑 / 平台的具体淡入淡出由 updateFinishFade 驱动
-    this.built.extra.visible = mode !== 'interior';
+    this.built.extra.visible = mode !== 'interior' && mode !== 'today';
     // 内部漫游时收掉施工坡道，避免在内部视角里横穿画面
     this.built.rampSlabs.forEach((r) => (r.userData.hidden = inside));
 
@@ -1644,7 +1697,7 @@ export class KhufuViewer {
     // ── 建造收尾「封顶」渐变：0 = 建造中（看穿内部），1 = 完整外观。
     //    由时间轴连续驱动（0.88 → 1.0，约占 12% 时长），而不是某一帧的阈值突变，
     //    所以外壳会像真的一层层封起来那样丝滑地变实，而非硬切。
-    const seal = xray ? 0 : smooth((p - 0.88) / 0.12);
+    const seal = xray ? 0 : mode === 'today' ? 1 : smooth((p - 0.88) / 0.12);
     const lerpN = (a: number, b: number, t: number) => a + (b - a) * t;
 
     /* 建造期的「看穿」参数：外壳/石核由许多层砌块 + 实心棱台叠加，
@@ -1689,10 +1742,10 @@ export class KhufuViewer {
     const labelT = this.flags.showLabels ? innerT : 0;
 
     // 缓动跟随（用于手动切换模式；封顶渐变本身已由时间轴平滑驱动）
-    const k = Math.min(1, dt * 3.4);
+    const k = 1 - Math.exp(-dt * (this.reducedMotion ? 18 : 3.4));
     const stepTo = (cur: number, t: number) => {
       const n = cur + (t - cur) * k;
-      return Math.abs(n - t) < 0.0025 ? t : n;
+      return Math.abs(n - t) < 0.0001 ? t : n;
     };
     if (!inside) this.casingOpCur = stepTo(this.casingOpCur, casingT);
     this.coreOpCur = stepTo(this.coreOpCur, coreT);
@@ -1710,26 +1763,25 @@ export class KhufuViewer {
       this.innerOpCur === innerT &&
       this.plugOpCur === plugT;
 
-    // 只要还没完全实心，就按半透明渲染（关闭深度写入，保证内部先画、外壳混合其上）
-    const ghostCasing = this.casingOpCur < 0.999;
-    const ghostCore = this.coreOpCur < 0.999;
-    const ghostOrders = ghostCasing || ghostCore;
-    // 建造期改用 FrontSide：剔除背面后，视线穿过的半透明层数减半，内部清晰得多
+    // 始终沿用透明合成队列和深度写入。透明度达到 1 的最后一帧不再
+    // 突然重排为不透明物体；砌块与实体填充保持同层，避免交叠面突然跳变。
     const shellSide = translucent ? THREE.DoubleSide : THREE.FrontSide;
 
     if (!inside) {
       this.built.casingMat.opacity = this.casingOpCur;
-      this.built.casingMat.transparent = ghostCasing;
-      this.built.casingMat.depthWrite = !ghostCasing;
-      this.built.casingMat.side = ghostCasing ? shellSide : THREE.FrontSide;
-      this.built.casingSys.insts.forEach((m) => (m.renderOrder = ghostOrders ? 2 : 0));
-      this.built.capstone.renderOrder = ghostOrders ? 3 : 0;
+      this.built.casingMat.transparent = true;
+      this.built.casingMat.depthWrite = true;
+      this.built.casingMat.side = shellSide;
+      this.built.casingSys.insts.forEach((m) => (m.renderOrder = 2));
+      this.built.casingSys.fills.forEach((m) => (m.renderOrder = 2));
+      this.built.capstone.renderOrder = 3;
     }
     this.built.coreMat.opacity = this.coreOpCur;
-    this.built.coreMat.transparent = ghostCore;
-    this.built.coreMat.depthWrite = !ghostCore;
-    this.built.coreMat.side = ghostCore ? shellSide : THREE.FrontSide;
-    this.built.coreSys.insts.forEach((m) => (m.renderOrder = ghostOrders ? 1 : 0));
+    this.built.coreMat.transparent = true;
+    this.built.coreMat.depthWrite = true;
+    this.built.coreMat.side = shellSide;
+    this.built.coreSys.insts.forEach((m) => (m.renderOrder = 1));
+    this.built.coreSys.fills.forEach((m) => (m.renderOrder = 1));
 
     this.built.casingSys.seams.forEach((m) => {
       m.renderOrder = 4;
@@ -1745,15 +1797,14 @@ export class KhufuViewer {
       this.innerOpApplied = this.innerOpCur;
       this.emissiveApplied = this.emissiveCur;
       const io = this.innerOpCur;
-      const opaqueInner = io > 0.999;
       this.built.features.forEach((f) => {
         f.meshes.forEach((m) => {
           const mat = m.material as THREE.MeshStandardMaterial;
           if (!mat) return;
           if (mat.emissive) mat.emissiveIntensity = this.emissiveCur;
           mat.opacity = io;
-          mat.transparent = !opaqueInner;
-          mat.depthWrite = opaqueInner;
+          mat.transparent = true;
+          mat.depthWrite = true;
         });
       });
     }
@@ -1762,16 +1813,16 @@ export class KhufuViewer {
     // 地面：补块 / 基坑 / 平台交叉淡入淡出
     const plug = this.built.plugMat;
     plug.opacity = this.plugOpCur;
-    plug.transparent = this.plugOpCur < 0.999;
-    plug.depthWrite = !plug.transparent;
+    plug.transparent = true;
+    plug.depthWrite = true;
     const pitM = this.built.pitMat;
     pitM.opacity = this.pitOpCur;
-    pitM.transparent = this.pitOpCur < 0.999;
-    pitM.depthWrite = !pitM.transparent;
+    pitM.transparent = true;
+    pitM.depthWrite = true;
     const platM = this.built.plateauMat;
     platM.opacity = this.plateauOpCur;
-    platM.transparent = this.plateauOpCur < 0.999;
-    platM.depthWrite = !platM.transparent;
+    platM.transparent = true;
+    platM.depthWrite = true;
     this.built.groundPlug.visible = this.plugOpCur > 0.02;
     this.built.pit.visible = this.pitOpCur > 0.02;
     this.built.plateau.visible = this.plateauOpCur > 0.02;
@@ -1801,10 +1852,11 @@ export class KhufuViewer {
     }
     this.appliedP = p;
     this.progress = p;
+    this.workers.update(p, this.flags.playing, this.flags.mode);
     this.renderer.shadowMap.needsUpdate = true;
 
     // 石核显隐；透明度统一由 updateFinishFade 平滑驱动（这里不再直接赋值，避免打架）
-    const coreOn = this.flags.mode !== 'interior';
+    const coreOn = this.flags.mode !== 'interior' && !this.todayMode;
     this.built.core.visible = coreOn;
 
     // 顶石就位后，它覆盖的顶部砌层不再绘制，
@@ -1812,7 +1864,7 @@ export class KhufuViewer {
     const capOn = this.capstoneAllowed && p > 0.915;
     const capFrom = this.built.capCourseFrom;
     const keepCasing = (c: number) => {
-      if (this.todayMode) return c >= N_CASING - 5; // 今日现状：仅顶部残存 5 层
+      if (this.todayMode) return false; // 今日遗存由独立风化石核呈现。
       if (capOn && c >= capFrom) return false;
       return true;
     };
@@ -1899,7 +1951,7 @@ export class KhufuViewer {
     const target = new THREE.Vector3(f.anchor[0] * S, f.anchor[1] * S, f.anchor[2] * S);
     const dir = this.camera.position.clone().sub(this.controls.target).normalize();
     const pos = target.clone().add(dir.multiplyScalar(this.phase === 'interior' ? 2.4 : 5.5));
-    this.focusAnim = { pos, target, t: 0 };
+    this.focusCamera(pos, target);
   }
 
   /* --------------------------------------------------------- 相机机位 */
@@ -1911,7 +1963,26 @@ export class KhufuViewer {
       targetY + dist * Math.sin(elr),
       dist * Math.cos(elr) * Math.cos(azr),
     );
-    this.focusAnim = { pos, target: new THREE.Vector3(0, targetY, 0), t: 0 };
+    this.focusCamera(pos, new THREE.Vector3(0, targetY, 0));
+  }
+
+  private focusCamera(pos: THREE.Vector3, target: THREE.Vector3) {
+    this.flags.autoCamera = false;
+    this.flags.autoRotate = false;
+    this.controls.autoRotate = false;
+    this.onCameraControl?.();
+    if (this.reducedMotion) {
+      this.camera.position.copy(pos);
+      this.controls.target.copy(target);
+      this.focusAnim = null;
+      return;
+    }
+    this.focusAnim = {
+      pos, target,
+      fromPos: this.camera.position.clone(),
+      fromTarget: this.controls.target.clone(),
+      t: 0,
+    };
   }
 
   resetCamera() {
@@ -1923,7 +1994,11 @@ export class KhufuViewer {
     this.cameraPreset(46, 22, 40, HEIGHT * 0.4);
   }
 
-  private autoCameraUpdate(p: number) {
+  focusConstructionSite() {
+    this.focusCamera(new THREE.Vector3(8, 1.7, 20), new THREE.Vector3(4, 0, 16.2));
+  }
+
+  private autoCameraUpdate(p: number, dt = 0) {
     const steps = STEPS;
     let a = steps[0];
     let b = steps[steps.length - 1];
@@ -1938,18 +2013,28 @@ export class KhufuViewer {
     const t = smooth(clamp01((p - a.from) / span));
     const az = a.cam.az + (b.cam.az - a.cam.az) * t;
     const el = a.cam.el + (b.cam.el - a.cam.el) * t;
-    const dist = a.cam.dist + (b.cam.dist - a.cam.dist) * t;
+    const framing = Math.max(1.08, 1.2 / this.camera.aspect);
+    const dist = (a.cam.dist + (b.cam.dist - a.cam.dist) * t) * framing;
+    const tx = (a.cam.target[0] + (b.cam.target[0] - a.cam.target[0]) * t) * S;
     const ty = (a.cam.target[1] + (b.cam.target[1] - a.cam.target[1]) * t) * S;
+    const tz = (a.cam.target[2] + (b.cam.target[2] - a.cam.target[2]) * t) * S;
     const azr = (az * Math.PI) / 180;
     const elr = (el * Math.PI) / 180;
-    this.camera.position.set(dist * Math.cos(elr) * Math.sin(azr), ty + dist * Math.sin(elr), dist * Math.cos(elr) * Math.cos(azr));
-    this.controls.target.set(0, ty, 0);
+    this.autoPosition.set(tx + dist * Math.cos(elr) * Math.sin(azr), ty + dist * Math.sin(elr), tz + dist * Math.cos(elr) * Math.cos(azr));
+    this.autoTarget.set(tx, ty, tz);
+    const follow = dt > 0 ? 1 - Math.exp(-dt * 7) : 1;
+    this.camera.position.lerp(this.autoPosition, follow);
+    this.controls.target.lerp(this.autoTarget, follow);
   }
 
   /* --------------------------------------------------------- 循环 */
   private loop = () => {
     this.raf = requestAnimationFrame(this.loop);
-    const dt = this.clock.getDelta();
+    // 后台标签和调试暂停不应让建造过程突然跳过数个工序。
+    this.clock.update();
+    const elapsed = this.clock.getDelta();
+    if (document.hidden) return;
+    const dt = Math.min(elapsed, 0.05);
 
     if (this.flags.playing) {
       const next = this.progress + (dt * this.flags.speed) / 24;
@@ -1957,6 +2042,7 @@ export class KhufuViewer {
         this.setProgress(1);
         this.flags.playing = false;
         this.onProgress?.(1);
+        this.onPlayingChange?.(false);
       } else {
         this.setProgress(next);
         this.uiAcc += dt;
@@ -1981,14 +2067,14 @@ export class KhufuViewer {
     if (this.path) {
       /* 转场飞行期间不接受自动运镜 */
     } else if (this.flags.autoCamera) {
-      this.autoCameraUpdate(this.progress);
+      this.autoCameraUpdate(this.progress, dt);
     } else if (this.focusAnim) {
       const fa = this.focusAnim;
-      fa.t = Math.min(1, fa.t + dt * 1.4);
+      fa.t = Math.min(1, fa.t + dt / 0.85);
       const k = smooth(fa.t);
-      this.camera.position.lerp(fa.pos, k * 0.16);
-      this.controls.target.lerp(fa.target, k * 0.16);
-      if (fa.t >= 1 && this.camera.position.distanceTo(fa.pos) < 0.25) this.focusAnim = null;
+      this.camera.position.lerpVectors(fa.fromPos, fa.pos, k);
+      this.controls.target.lerpVectors(fa.fromTarget, fa.target, k);
+      if (fa.t >= 1) this.focusAnim = null;
     }
 
     // 太阳随建造进程绕塔心移动：方位角 + 高度角同步变化，
@@ -2006,29 +2092,34 @@ export class KhufuViewer {
     }
 
     // 头灯：仅内部漫游阶段渐亮，照亮 1 m 宽的深通道
-    const lampTarget = this.phase === 'interior' ? 60 : 0;
-    this.headLamp.intensity += (lampTarget - this.headLamp.intensity) * Math.min(1, dt * 3.2);
+    // 模型按 1:10 缩放，米宽窄廊的墙面只距灯数厘米场景单位；
+    // 避免沿用室外强度导致逆平方衰减后的近墙高光完全过曝。
+    const narrowPassage = [0, 1, 3, 9].includes(this.curStation);
+    const lampTarget = this.phase === 'interior' ? (narrowPassage ? 0.045 : 0.65) : 0;
+    this.headLamp.intensity += (lampTarget - this.headLamp.intensity) * (1 - Math.exp(-dt * 3.2));
     this.headLamp.position.copy(this.camera.position);
     // 建造信标：标记内部结构正在施工的位置
     this.updateConstructionBeacon(dt);
     // 收尾 / 模式切换淡入淡出（必须在渲染前更新）
     this.updateFinishFade(dt);
 
-    this.controls.update();
+    this.controls.dampingFactor = 1 - Math.exp(-dt * 4.35);
+    this.controls.update(dt);
     this.renderFrame();
     this.updateLabels();
   };
 
-  /** 统一渲染入口：开启光线追踪时走 EffectComposer（GTAO+泛光+色调映射+SMAА）
-      切到内部（漫游 / 仅内部结构）时关闭光线追踪——真实墓室里没有可被追踪的光线，
-      关掉既更符合实际，也省 GPU。 */
+  /** 内部与剖切视图保留清楚的结构配色，外观启用接触阴影。 */
   private renderFrame() {
-    const interior = this.flags.mode === 'inside' || this.flags.mode === 'interior';
-    if (this.flags.rayTracing && !interior && this.composer) {
-      this.composer.render();
-    } else {
-      this.renderer.render(this.scene, this.camera);
-    }
+    const { mode } = this.flags;
+    const interior = mode === 'inside' || mode === 'interior';
+    this.pipeline.render({
+      enhanced: this.flags.rayTracing && !interior,
+      // GTAO only acquires the exterior silhouette at 0.99 opacity. Fade its
+      // contribution after that point instead of exposing a new shadow at once.
+      ambientOcclusion: mode === 'cut' || mode === 'translucent' ? 0
+        : mode === 'today' ? 1 : smooth((Math.min(this.casingOpCur, this.coreOpCur) - 0.99) / 0.01),
+    });
   }
 
   private updateLabels() {
@@ -2132,35 +2223,51 @@ export class KhufuViewer {
   resize() {
     const w = this.canvas.clientWidth || 1;
     const h = this.canvas.clientHeight || 1;
-    this.renderer.setSize(w, h, false);
     this.camera.aspect = w / h;
     this.camera.updateProjectionMatrix();
-    if (this.composer) {
-      this.composer.setPixelRatio(Math.min(window.devicePixelRatio, 1.25));
-      this.composer.setSize(w, h);
-    }
+    this.pipeline?.resize(w, h);
   }
 
-  /** 开关光线追踪（GTAO + 泛光） */
+  /** 开关实时接触阴影和高光后处理。 */
   setRayTracing(on: boolean) {
     this.flags.rayTracing = on;
-    if (this.gtaoPass) this.gtaoPass.enabled = on;
-    if (this.bloomPass) this.bloomPass.enabled = on;
   }
 
   setPlaying(playing: boolean, speed: number) {
-    this.flags.playing = playing;
+    this.flags.playing = playing && this.flags.mode !== 'inside';
     this.flags.speed = speed;
   }
 
   dispose() {
     cancelAnimationFrame(this.raf);
+    this.clock.dispose();
+    this.inputCleanup?.();
     this.controls.dispose();
-    this.renderer.dispose();
-    this.composer?.dispose();
+    this.mixer?.stopAllAction();
+    this.pipeline?.dispose();
+    this.environment?.dispose();
+    this.sun.shadow.dispose();
+    const geometries = new Set<THREE.BufferGeometry>();
+    const materials = new Set<THREE.Material>();
+    const textures = new Set<THREE.Texture>();
     this.scene.traverse((o) => {
       const m = o as THREE.Mesh;
-      if (m.geometry) m.geometry.dispose();
+      if (m.geometry) geometries.add(m.geometry);
+      if (m.material) {
+        for (const material of Array.isArray(m.material) ? m.material : [m.material]) {
+          materials.add(material);
+          for (const value of Object.values(material)) {
+            if (value instanceof THREE.Texture) textures.add(value);
+          }
+        }
+      }
+      if ((m as THREE.InstancedMesh).isInstancedMesh) (m as THREE.InstancedMesh).dispose();
     });
+    geometries.forEach((geometry) => geometry.dispose());
+    materials.forEach((material) => material.dispose());
+    textures.forEach((texture) => texture.dispose());
+    this.labelHost?.replaceChildren();
+    this.labelEls.clear();
+    this.renderer.dispose();
   }
 }
