@@ -1,24 +1,25 @@
 # -*- coding: utf-8 -*-
 """
 ================================================================================
-  胡夫金字塔 Great Pyramid of Khufu  ·  Blender 5.2 一键生成脚本
-  外立面 + 完整连通内部结构 + 建造过程动画  ->  .blend  /  .glb
+  胡夫金字塔 Great Pyramid of Khufu  ·  Blender 工程生成脚本
+  简化外立面 + 内部结构示意 + 建造过程动画  ->  .blend  /  .glb
 --------------------------------------------------------------------------------
   使用方法（二选一）
 
   A) 图形界面（推荐）
-     1. 打开 Blender 5.2
+     1. 打开 Blender（已在 5.2.1 验证）
      2. 顶部工作区标签切到 "Scripting"
-     3. 点 "Open" 选择本文件  ->  点 ▶ Run Script（或按 Alt+P）
-     4. 运行结束后：桌面出现 khufu_great_pyramid.blend 与 .glb
-        当前文件即为完整工程文件，直接 Cmd+S 也可另存
+     3. 在文本编辑器中点 "Open" 选择本文件 -> ▶ Run Script（或 Alt+P）
+        不要用 File > Open 打开 .py，也不要用系统 Python 运行
+     4. 默认输出至 ~/Downloads/KhufuPyramid/，完成时显示实际路径
+        .blend 打开即显示完成态；跳到第 1 帧再播放 480 帧建造动画
 
   B) 命令行 / 无界面（macOS 终端，一次跑完）
-     /Applications/Blender.app/Contents/MacOS/Blender --background \
-        --python ~/Desktop/khufu_great_pyramid.py
+     /Applications/Blender.app/Contents/MacOS/Blender --background --factory-startup \
+        --python ~/Downloads/khufu_great_pyramid.py -- --output-dir ~/Downloads/KhufuPyramid
 
   查看内部结构：
-     - 集合面板里关闭 "04_石灰岩外壳" 的显示器图标（即可透视全部连通通道与墓室）；或
+     - 同时隐藏 "02_石核砌体" 和 "04_石灰岩外壳" 查看内部实体示意；或
      - 场景中已放置 "剖切方块_东北象限" 并挂好 Boolean 修改器（默认关闭）
        在修改器面板点开 Boolean 的显示眼睛即可得到四分之一剖切视图
   渲染动画：
@@ -26,7 +27,17 @@
 ================================================================================
 """
 
-import bpy, bmesh, math, os
+import argparse
+import math
+import os
+import sys
+import tempfile
+
+try:
+    import bpy
+    import bmesh
+except ModuleNotFoundError as error:
+    raise SystemExit('请在 Blender 的 Scripting 文本编辑器中运行，或用 Blender --background --python 本文件；不能使用系统 Python。') from error
 from mathutils import Vector, Matrix
 
 # ------------------------------------------------------------------ 可调参数
@@ -37,7 +48,19 @@ N_CASING  = 40         # 白色外壳层数
 TREAD     = 0.65       # 石核每层内缩 (m)
 FPS       = 24
 FRAME_END = 480        # 建造动画总帧数
-OUT_DIR   = os.path.expanduser("~/Desktop")
+OUT_DIR   = os.path.expanduser("~/Downloads/KhufuPyramid")  # 可改为自己的输出目录
+
+parser = argparse.ArgumentParser(description='生成胡夫金字塔 Blender 工程')
+parser.add_argument('--output-dir', default=OUT_DIR, help='输出 .blend 和 .glb 的文件夹')
+args = parser.parse_args(sys.argv[sys.argv.index('--') + 1:] if '--' in sys.argv else [])
+OUT_DIR = os.path.abspath(os.path.expanduser(args.output_dir))
+try:
+    os.makedirs(OUT_DIR, exist_ok=True)
+    # 提前验证写权限，避免建模完成后才发现目录不可写。
+    with tempfile.TemporaryFile(dir=OUT_DIR) as probe:
+        probe.write(b'khufu')
+except OSError as error:
+    raise RuntimeError('无法写入输出目录 %s；请修改 OUT_DIR 或传入 --output-dir。' % OUT_DIR) from error
 
 HALF  = BASE_SIDE / 2.0
 SLOPE = HEIGHT / HALF
@@ -53,18 +76,6 @@ C_GRANITE= (0.58, 0.28, 0.24, 1.0)
 C_WOOD   = (0.42, 0.26, 0.14, 1.0)
 
 # ============================================================ 基础工具函数
-def purge():
-    for ob in list(bpy.data.objects):
-        bpy.data.objects.remove(ob, do_unlink=True)
-    for col in list(bpy.data.collections):
-        bpy.data.collections.remove(col)
-    for blk in (bpy.data.meshes, bpy.data.curves, bpy.data.materials):
-        for item in list(blk):
-            try:
-                blk.remove(item)
-            except Exception:
-                pass
-
 def new_collection(name):
     col = bpy.data.collections.new(name)
     bpy.context.scene.collection.children.link(col)
@@ -99,13 +110,13 @@ def mat(name, color, rough=0.85, metal=0.0, alpha=1.0, emit=0.0):
         set_input(bsdf, ['Emission Strength'], emit)
     if alpha < 1.0:
         try:
-            m.surface_render_method = 'BLENDED'
+            m.surface_render_method = 'DITHERED'
         except Exception:
             try:
                 m.blend_method = 'BLEND'
             except Exception:
                 pass
-    m.diffuse_color = color
+    m.diffuse_color = (*color[:3], alpha)
     return m
 
 def _cone(bm, r1, r2, depth, matrix):
@@ -195,6 +206,8 @@ def set_ease(ob):
             for kp in fc.keyframe_points:
                 try:
                     kp.interpolation = 'BEZIER'
+                    kp.handle_left_type = 'AUTO_CLAMPED'
+                    kp.handle_right_type = 'AUTO_CLAMPED'
                 except Exception:
                     pass
                 try:
@@ -224,6 +237,23 @@ def grow(ob, f_start, f_end, axis='Z', f_ins=0.02, ease=True):
         set_ease(ob)
 
 def hide_anim(ob, f_in, f_out=None):
+    # glTF 不支持 hide_render/hide_viewport 动画，额外用三轴缩放隐藏待建构件。
+    start_scale = list(ob.scale)
+    action = ob.animation_data.action if ob.animation_data else None
+    for curve in action_fcurves(action):
+        if curve.data_path == 'scale':
+            start_scale[curve.array_index] = curve.evaluate(f_in)
+    ob.scale = (0.000001,) * 3
+    ob.keyframe_insert(data_path='scale', frame=1)
+    ob.keyframe_insert(data_path='scale', frame=f_in - 1)
+    ob.scale = start_scale
+    ob.keyframe_insert(data_path='scale', frame=f_in)
+    set_ease(ob)
+    for curve in action_fcurves(ob.animation_data.action):
+        if curve.data_path == 'scale':
+            for key in curve.keyframe_points:
+                if key.co.x < f_in:
+                    key.interpolation = 'CONSTANT'
     try:
         ob.hide_render = True
         ob.keyframe_insert(data_path='hide_render', frame=f_in - 1)
@@ -257,12 +287,16 @@ T_TOP, T_FIN          = f_at(0.93), f_at(0.97)
 
 # ============================================================ 开始构建
 print("\n=== 胡夫金字塔生成器 · Blender", bpy.app.version_string, "===")
-purge()
-sc = bpy.context.scene
+sc = bpy.data.scenes.new('Khufu_Generated')
+bpy.context.window.scene = sc
 sc.render.fps = FPS
 sc.frame_start, sc.frame_end = 1, FRAME_END
 sc.unit_settings.system = 'METRIC'
 sc.unit_settings.scale_length = 1.0
+sc.render.resolution_x = 1600
+sc.render.resolution_y = 1000
+sc.render.resolution_percentage = 100
+sc.render.filepath = os.path.join(OUT_DIR, 'frames', 'khufu_')
 
 try:
     items = [i.identifier for i in sc.render.bl_rna.properties['engine'].enum_items]
@@ -420,7 +454,7 @@ for i in range(N_CASING):
     z0 = i * ch
     b_half = HALF * (1.0 - z0 / HEIGHT)
     t_half = HALF * (1.0 - (z0 + ch) / HEIGHT)
-    ob = slab("外壳_层%02d" % (i + 1), c_casing, b_half * 1.001, t_half * 1.001, ch * 1.004, M_CAS_T, z0)
+    ob = slab("外壳_层%02d" % (i + 1), c_casing, b_half * 1.001, t_half * 1.001, ch * 1.004, M_CASING, z0)
     f0 = T_CASING + int((N_CASING - 1 - i) * (T_CASING_E - T_CASING) / float(N_CASING))
     grow(ob, f0, f0 + max(6, int((T_CASING_E - T_CASING) / (N_CASING + 6.0) * 0.8)))
     hide_anim(ob, f0)
@@ -437,7 +471,8 @@ hide_anim(pyramidion, T_TOP)
 
 # 相机运镜
 cam_data = bpy.data.cameras.new("相机")
-cam_data.lens = 50.0
+cam_data.lens = 38.0
+cam_data.clip_end = 5000.0
 cam = bpy.data.objects.new("相机", cam_data)
 c_top.objects.link(cam)
 sc.camera = cam
@@ -459,17 +494,21 @@ def place(az_deg, el_deg, dist, ty, frame):
     target.location = (0.0, 0.0, ty)
     target.keyframe_insert(data_path='location', frame=frame)
 
-shots = [(1, 34, 40, 380, 10), (f_at(0.08), 74, 14, 280, 6), (f_at(0.30), 24, 20, 340, 90),
-         (f_at(0.44), 118, 30, 310, 140), (f_at(0.58), 168, 20, 320, 300),
-         (f_at(0.68), 212, 34, 350, 420), (f_at(0.80), 286, 14, 370, 430),
-         (f_at(0.93), 336, 26, 320, 620), (F, 392, 20, 390, 360)]
+shots = [(1, 34, 32, 460, 40), (f_at(0.08), 74, 24, 440, 40), (f_at(0.30), 24, 26, 450, 50),
+         (f_at(0.44), 118, 30, 460, 55), (f_at(0.58), 168, 24, 450, 55),
+         (f_at(0.68), 212, 30, 460, 60), (f_at(0.80), 286, 24, 460, 60),
+         (f_at(0.93), 336, 26, 460, 65), (F, 392, 24, 460, 65)]
 for (fr, az, el, dist, ty) in shots:
     place(az, el, dist, ty, fr)
+set_ease(cam)
+set_ease(target)
 
 # 剖切参考方块
 cut = box("剖切方块_东北象限", c_top, (HALF * 2.4, HEIGHT * 1.6, HALF * 2.4), M_ROCK,
           loc=(HALF * 1.1, HEIGHT * 0.7, HALF * 1.1))
 cut.display_type = 'WIRE'
+cut.hide_render = True
+cut.hide_set(True)
 for ob in core_objs + [o for o in c_casing.objects]:
     try:
         md = ob.modifiers.new("剖切(Boolean)", type='BOOLEAN')
@@ -482,14 +521,38 @@ for ob in core_objs + [o for o in c_casing.objects]:
 
 # 保存 / 导出
 print("\n构建完成：石核 %d 层 / 外壳 %d 层 / 内部连通构件 %d 个" % (N_CORE, N_CASING, len(c_inner.objects)))
+sc.frame_set(FRAME_END)
+bpy.context.view_layer.update()
+# 保存的默认视图直接展示完成态，不让新打开的工程看起来是空场景。
+for screen in bpy.data.screens:
+    for area in screen.areas:
+        if area.type == 'VIEW_3D':
+            area.spaces.active.clip_end = 5000.0
+            area.spaces.active.region_3d.view_perspective = 'CAMERA'
 try:
     bpy.ops.wm.save_as_mainfile(filepath=BLEND_PATH)
     print("已保存工程文件 ->", BLEND_PATH)
 except Exception as e:
-    print("保存 .blend 失败:", e)
+    raise RuntimeError('保存 .blend 失败：%s\n%s' % (BLEND_PATH, e)) from e
 
 try:
-    bpy.ops.export_scene.gltf(filepath=GLB_PATH, export_format='GLB')
+    bpy.ops.export_scene.gltf(
+        filepath=GLB_PATH, export_format='GLB',
+        use_active_scene=True, use_renderable=True,
+        export_current_frame=True, export_animations=True,
+        export_animation_mode='SCENE', export_anim_scene_split_object=False,
+        export_frame_range=True,
+        export_cameras=True, export_force_sampling=True,
+    )
     print("已导出预览文件 ->", GLB_PATH)
-except Exception:
-    pass
+except Exception as e:
+    raise RuntimeError('.blend 已保存到 %s，但 GLB 导出失败：%s。请确认 Blender 的 glTF 2.0 导出插件可用。' % (BLEND_PATH, e)) from e
+
+sc.frame_set(FRAME_END)
+print('完成！输出目录：', OUT_DIR)
+if not bpy.app.background:
+    def show_result(self, context):
+        self.layout.label(text='已生成 .blend 工程和 .glb 动画模型')
+        self.layout.label(text=OUT_DIR)
+        self.layout.label(text='当前为完成态；跳到第 1 帧即可播放建造动画')
+    bpy.context.window_manager.popup_menu(show_result, title='胡夫金字塔导出完成', icon='CHECKMARK')

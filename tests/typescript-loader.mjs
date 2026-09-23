@@ -2,13 +2,19 @@ import { readFile } from 'node:fs/promises';
 import ts from 'typescript';
 
 export async function resolve(specifier, context, nextResolve) {
-  if (specifier.startsWith('.') && !/\.[a-z]+$/i.test(specifier)) {
+  if (specifier.startsWith('.') && !/\.[a-z]+$/i.test(specifier) && !specifier.endsWith('?raw')) {
     return nextResolve(`${specifier}.ts`, context);
   }
   return nextResolve(specifier, context);
 }
 
 export async function load(url, context, nextLoad) {
+  if (url.endsWith('?raw')) {
+    const path = new URL(url);
+    path.search = '';
+    return { format: 'module', shortCircuit: true,
+      source: `export default ${JSON.stringify(await readFile(path, 'utf8'))};` };
+  }
   if (url.endsWith('.ts')) {
     const source = await readFile(new URL(url), 'utf8');
     return {

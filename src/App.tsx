@@ -180,13 +180,13 @@ export default function App() {
               胡夫金字塔 · 3D 构造图与建造动画
             </h1>
             <p className="text-[10.5px] text-slate-400">
-              Great Pyramid of Khufu · 外立面 + 内部结构 + 建造过程 ｜ 与 Blender 5.2 工程同源数据
+              Great Pyramid of Khufu · 外立面 + 内部结构 + 建造过程
             </p>
           </div>
         </Panel>
         <div className="pointer-events-auto flex items-center gap-2">
           <Btn variant="gold" onClick={() => setShowExport(true)}>
-            ⬇ Blender 5.2 工程文件
+            ⬇ Blender 生成脚本
           </Btn>
           <button
             type="button"
