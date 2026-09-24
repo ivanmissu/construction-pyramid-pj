@@ -26,6 +26,20 @@ scene = bpy.context.scene
 saved_frame = scene.frame_current
 glb = (output / 'khufu_great_pyramid.glb').read_bytes()
 gltf = json.loads(glb[20:20 + struct.unpack_from('<I', glb, 12)[0]])
+binary_start = 28 + struct.unpack_from('<I', glb, 12)[0]
+
+
+def animation_values(name, path):
+    node_index = next(i for i, node in enumerate(gltf['nodes']) if node.get('name') == name)
+    animation = gltf['animations'][0]
+    channel = next(channel for channel in animation['channels']
+                   if channel['target']['node'] == node_index and channel['target']['path'] == path)
+    accessor = gltf['accessors'][animation['samplers'][channel['sampler']]['output']]
+    view = gltf['bufferViews'][accessor['bufferView']]
+    assert accessor['componentType'] == 5126 and accessor['type'] == 'VEC3'
+    offset = binary_start + view.get('byteOffset', 0) + accessor.get('byteOffset', 0)
+    stride = view.get('byteStride', 12)
+    return [struct.unpack_from('<3f', glb, offset + i * stride) for i in range(accessor['count'])]
 
 
 class BlenderExportTests(unittest.TestCase):
@@ -41,6 +55,12 @@ class BlenderExportTests(unittest.TestCase):
             point = world_to_camera_view(scene, scene.camera, Vector((0, 0, 65)))
             self.assertTrue(0 < point.x < 1 and 0 < point.y < 1 and point.z > 0,
                             f'pyramid outside camera at frame {frame}: {point}')
+        scene.frame_set(480)
+        for position in [(-115.165, -115.165, 0), (115.165, -115.165, 0),
+                         (-115.165, 115.165, 0), (115.165, 115.165, 0), (0, 0, 146.6)]:
+            point = world_to_camera_view(scene, scene.camera, Vector(position))
+            self.assertTrue(0.02 < point.x < 0.98 and 0.02 < point.y < 0.98,
+                            f'completed pyramid clipped at {position}: {point}')
 
     def test_cutting_helper_is_not_rendered_or_exported(self):
         helper = next(ob for ob in scene.objects if ob.name.startswith('剖切方块'))
@@ -61,6 +81,14 @@ class BlenderExportTests(unittest.TestCase):
         scene.frame_set(480)
         for name in ('石核_层40', '外壳_层01', '顶石_Pyramidion'):
             self.assertTrue(all(abs(v - 1) < 0.0001 for v in scene.objects[name].scale), name)
+
+    def test_exported_animation_samples_really_build_the_model(self):
+        for name in ('石核_层40', '外壳_层01', '顶石_Pyramidion'):
+            scales = animation_values(name, 'scale')
+            self.assertLess(max(scales[0]), 0.0001, name)
+            self.assertTrue(all(abs(value - 1) < 0.0001 for value in scales[-1]), name)
+        positions = animation_values('顶石_Pyramidion', 'translation')
+        self.assertGreater(positions[0][1], positions[-1][1] + 30)
 
     def test_existing_user_scene_survives_generation(self):
         if existing:

@@ -1190,7 +1190,12 @@ export class KhufuViewer {
   private readonly autoTarget = new THREE.Vector3();
   private glbGroup = new THREE.Group();
   private mixer: THREE.AnimationMixer | null = null;
+  private glbActions: THREE.AnimationAction[] = [];
   private glbDuration = 1;
+  private glbCameraState: {
+    position: THREE.Vector3; target: THREE.Vector3; near: number; far: number;
+    minDistance: number; maxDistance: number; maxPolarAngle: number;
+  } | null = null;
   private capstoneAllowed = true;
   private todayMode = false;
   private todayExterior: ReturnType<typeof buildTodayExterior> | null = null;
@@ -1932,7 +1937,7 @@ export class KhufuViewer {
 
     // 外部 GLB
     if (this.mixer) {
-      this.mixer.setTime(this.progress * this.glbDuration);
+      this.sampleGLB(this.progress * this.glbDuration);
     }
   }
 
@@ -2066,7 +2071,7 @@ export class KhufuViewer {
         }
       }
     }
-    if (this.mixer) this.mixer.setTime(this.progress * this.glbDuration);
+    if (this.mixer) this.sampleGLB(this.progress * this.glbDuration);
 
     // 进入 / 退出转场：外壳淡入淡出 + 相机分段飞行
     if (this.enterAnim) {
@@ -2195,11 +2200,24 @@ export class KhufuViewer {
     const buf = await file.arrayBuffer();
     const loader = new GLTFLoader();
     const gltf = await loader.parseAsync(buf, '');
-    this.glbGroup.clear();
-    this.glbGroup.add(gltf.scene);
+    if (!this.glbCameraState) {
+      this.glbCameraState = {
+        position: this.camera.position.clone(), target: this.controls.target.clone(),
+        near: this.camera.near, far: this.camera.far,
+        minDistance: this.controls.minDistance, maxDistance: this.controls.maxDistance,
+        maxPolarAngle: this.controls.maxPolarAngle,
+      };
+    }
+    this.releaseGLB();
+    const imported = new THREE.Group();
+    imported.add(gltf.scene);
+    this.glbGroup.add(imported);
     this.mixer = new THREE.AnimationMixer(gltf.scene);
     for (const clip of gltf.animations) {
-      this.mixer.clipAction(clip).play();
+      const action = this.mixer.clipAction(clip);
+      action.setLoop(THREE.LoopOnce, 1);
+      action.clampWhenFinished = true;
+      this.glbActions.push(action.play());
     }
     this.glbDuration = gltf.animations.length ? Math.max(...gltf.animations.map((c) => c.duration)) : 1;
     this.glbGroup.traverse((o) => {
@@ -2211,20 +2229,106 @@ export class KhufuViewer {
     });
     this.built.root.visible = false;
     if (this.labelHost) this.labelHost.style.opacity = '0';
-    // 自动取景
-    const box = new THREE.Box3().setFromObject(gltf.scene);
-    const size = box.getSize(new THREE.Vector3()).length();
+    // 在建成帧取建筑包围盒。初帧的构件几乎为零，且背景地形不能参与主体取景。
+    this.sampleGLB(this.glbDuration);
+    imported.updateMatrixWorld(true);
+    const generated = gltf.scene.userData.khufu_generator === 'construction-pyramid-v1' ||
+      !!gltf.scene.getObjectByName('石核_层40');
+    const box = new THREE.Box3();
+    gltf.scene.traverse((o) => {
+      const mesh = o as THREE.Mesh;
+      if (!mesh.isMesh || (generated && ['沙漠地表', '吉萨高原基岩平台'].includes(mesh.name))) return;
+      box.union(new THREE.Box3().setFromObject(mesh));
+    });
+    if (box.isEmpty()) box.setFromCenterAndSize(new THREE.Vector3(), new THREE.Vector3(1, 1, 1));
+    const extent = box.getSize(new THREE.Vector3());
+    const scale = generated ? S : 30 / Math.max(extent.x, extent.y, extent.z, 0.001);
+    // Blender 使用米；其他来源也归一到内置场景附近的尺度，保留原始动画局部坐标。
+    const offset = new THREE.Vector3(-box.getCenter(new THREE.Vector3()).x * scale,
+      generated ? 0 : -box.min.y * scale, -box.getCenter(new THREE.Vector3()).z * scale);
+    imported.scale.setScalar(scale);
+    imported.position.copy(offset);
+    box.min.multiplyScalar(scale).add(offset);
+    box.max.multiplyScalar(scale).add(offset);
     const center = box.getCenter(new THREE.Vector3());
+    const radius = Math.max(box.getSize(new THREE.Vector3()).length() * 0.5, 0.01);
+    const verticalFov = THREE.MathUtils.degToRad(this.camera.fov);
+    const horizontalFov = 2 * Math.atan(Math.tan(verticalFov / 2) * this.camera.aspect);
+    const distance = 1.15 * radius / Math.sin(Math.min(verticalFov, horizontalFov) / 2);
+    imported.updateMatrixWorld(true);
+    const wholeSize = new THREE.Box3().setFromObject(imported).getSize(new THREE.Vector3()).length();
+    this.camera.near = Math.min(0.006, radius / 1000);
+    this.camera.far = Math.max(1300, wholeSize * 2 + distance);
+    this.camera.updateProjectionMatrix();
+    this.controls.minDistance = Math.max(0.01, radius * 0.01);
+    this.controls.maxDistance = Math.max(260, distance * 4);
+    this.controls.maxPolarAngle = Math.PI * 0.495;
+    this.flags.autoCamera = false;
+    this.flags.autoRotate = false;
+    this.controls.autoRotate = false;
+    this.focusAnim = null;
+    this.path = null;
+    this.enterAnim = null;
+    this.onCameraControl?.();
     this.controls.target.copy(center);
-    this.camera.position.copy(center.clone().add(new THREE.Vector3(size * 0.7, size * 0.5, size * 0.7)));
-    this.mixer.setTime(0);
+    this.camera.position.copy(center).addScaledVector(new THREE.Vector3(0.7, 0.5, 0.7).normalize(), distance);
+    this.controls.update();
+    this.sampleGLB(0);
+    this.renderer.shadowMap.needsUpdate = true;
     return { duration: this.glbDuration, clips: gltf.animations.map((c) => c.name) };
   }
 
-  clearGLB() {
-    this.mixer?.stopAllAction();
+  private sampleGLB(time: number) {
+    // LoopOnce 保留 100% 的终帧；重新启用暂停的 action 后也能从终点往回拖动。
+    for (const action of this.glbActions) {
+      action.enabled = true;
+      action.paused = false;
+    }
+    this.mixer?.setTime(time);
+  }
+
+  private releaseGLB() {
+    if (this.mixer) {
+      this.mixer.stopAllAction();
+      this.mixer.uncacheRoot(this.mixer.getRoot());
+    }
     this.mixer = null;
+    this.glbActions = [];
+    const geometries = new Set<THREE.BufferGeometry>();
+    const materials = new Set<THREE.Material>();
+    const textures = new Set<THREE.Texture>();
+    this.glbGroup.traverse((o) => {
+      const mesh = o as THREE.Mesh;
+      if (mesh.geometry) geometries.add(mesh.geometry);
+      for (const material of mesh.material ? (Array.isArray(mesh.material) ? mesh.material : [mesh.material]) : []) {
+        materials.add(material);
+        for (const value of Object.values(material)) if (value instanceof THREE.Texture) textures.add(value);
+      }
+    });
+    geometries.forEach((geometry) => geometry.dispose());
+    materials.forEach((material) => material.dispose());
+    textures.forEach((texture) => texture.dispose());
     this.glbGroup.clear();
+  }
+
+  clearGLB() {
+    this.releaseGLB();
+    this.focusAnim = null;
+    this.path = null;
+    this.enterAnim = null;
+    if (this.glbCameraState) {
+      const state = this.glbCameraState;
+      this.camera.position.copy(state.position);
+      this.camera.near = state.near;
+      this.camera.far = state.far;
+      this.camera.updateProjectionMatrix();
+      this.controls.target.copy(state.target);
+      this.controls.minDistance = state.minDistance;
+      this.controls.maxDistance = state.maxDistance;
+      this.controls.maxPolarAngle = state.maxPolarAngle;
+      this.controls.update();
+      this.glbCameraState = null;
+    }
     this.built.root.visible = true;
     if (this.labelHost) this.labelHost.style.opacity = this.flags.showLabels ? '1' : '0';
     this.applyMode();

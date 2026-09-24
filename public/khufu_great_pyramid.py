@@ -254,20 +254,8 @@ def hide_anim(ob, f_in, f_out=None):
             for key in curve.keyframe_points:
                 if key.co.x < f_in:
                     key.interpolation = 'CONSTANT'
-    try:
-        ob.hide_render = True
-        ob.keyframe_insert(data_path='hide_render', frame=f_in - 1)
-        ob.hide_render = False
-        ob.keyframe_insert(data_path='hide_render', frame=f_in)
-    except Exception:
-        pass
-    try:
-        ob.hide_viewport = True
-        ob.keyframe_insert(data_path='hide_viewport', frame=f_in - 1)
-        ob.hide_viewport = False
-        ob.keyframe_insert(data_path='hide_viewport', frame=f_in)
-    except Exception:
-        pass
+    # 保持依赖图更新：hide_viewport 会冻结隐藏物体的矩阵，glTF 采样将读到错误的完成态。
+    # Blender 和 glTF 均使用上面的近零缩放表示待建状态。
 
 def fade_out(ob, f_start, f_end):
     ob.scale = (1.0, 1.0, 1.0)
@@ -288,6 +276,7 @@ T_TOP, T_FIN          = f_at(0.93), f_at(0.97)
 # ============================================================ 开始构建
 print("\n=== 胡夫金字塔生成器 · Blender", bpy.app.version_string, "===")
 sc = bpy.data.scenes.new('Khufu_Generated')
+sc['khufu_generator'] = 'construction-pyramid-v1'
 bpy.context.window.scene = sc
 sc.render.fps = FPS
 sc.frame_start, sc.frame_end = 1, FRAME_END
@@ -471,7 +460,7 @@ hide_anim(pyramidion, T_TOP)
 
 # 相机运镜
 cam_data = bpy.data.cameras.new("相机")
-cam_data.lens = 38.0
+cam_data.lens = 28.0
 cam_data.clip_end = 5000.0
 cam = bpy.data.objects.new("相机", cam_data)
 c_top.objects.link(cam)
@@ -542,6 +531,7 @@ try:
         export_current_frame=True, export_animations=True,
         export_animation_mode='SCENE', export_anim_scene_split_object=False,
         export_frame_range=True,
+        export_extras=True,
         export_cameras=True, export_force_sampling=True,
     )
     print("已导出预览文件 ->", GLB_PATH)
